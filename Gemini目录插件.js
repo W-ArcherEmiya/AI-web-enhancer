@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         Gemini 目录插件
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.1.1
 // @description  生成高效的Gemini对话目录索引窗口。
 // @author       Gemini Assistant
 // @match        https://gemini.google.com/*
 // @grant        none
 // @run-at       document-idle
+// @license      MIT
+// @history      2.1.1 修复单次多行命令以多书签条目显示问题，以及偶发定位失效问题。
 // ==/UserScript==
 
 (function() {
