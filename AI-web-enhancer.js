@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 目录插件 (Gemini & ChatGPT)
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  生成高效的 Gemini 与 ChatGPT 对话目录索引窗口。
 // @author       ArcherEmiya
 // @match        https://gemini.google.com/*
@@ -36,7 +36,7 @@
     }
 
     cleanUpOldVersions();
-    console.log('AI TOC Plugin v2.3: started');
+    console.log('AI TOC Plugin v2.4: started');
 
     const IS_CHATGPT = window.location.hostname.includes('chatgpt.com');
     const CONFIG = {
@@ -48,7 +48,12 @@
         activeIndex: -1,
         scrollContainer: null,
         syncFrame: 0,
-        resizeBound: false
+        resizeBound: false,
+        scanTimer: 0,
+        positionTimer: 0,
+        positionCache: [],
+        positionsDirty: true,
+        observer: null
     };
 
     const PATHS = {
@@ -246,6 +251,115 @@
         return window;
     }
 
+    function scheduleScan(delay) {
+        if (STATE.scanTimer) {
+            window.clearTimeout(STATE.scanTimer);
+        }
+        STATE.scanTimer = window.setTimeout(() => {
+            STATE.scanTimer = 0;
+            scanContent();
+        }, typeof delay === 'number' ? delay : 120);
+    }
+
+    function schedulePositionRefresh() {
+        STATE.positionsDirty = true;
+        if (STATE.positionTimer) return;
+
+        STATE.positionTimer = window.setTimeout(() => {
+            STATE.positionTimer = 0;
+            if (STATE.messages.length) {
+                refreshPositionCache();
+                scheduleActiveSync();
+            }
+        }, 80);
+    }
+
+    function refreshPositionCache() {
+        const messages = STATE.messages;
+        if (!messages.length) {
+            STATE.positionCache = [];
+            STATE.positionsDirty = false;
+            return;
+        }
+
+        const container = STATE.scrollContainer || getScrollContainer();
+        const viewportTop = getViewportRect(container).top;
+        const scrollTop = getScrollTop(container);
+        const positions = new Array(messages.length);
+        let lastTop = 0;
+
+        for (let i = 0; i < messages.length; i++) {
+            const message = messages[i];
+            const anchor = message.anchor || message.container;
+            if (!anchor || !anchor.isConnected) {
+                positions[i] = lastTop;
+                continue;
+            }
+
+            const rect = anchor.getBoundingClientRect();
+            const top = scrollTop + rect.top - viewportTop;
+            positions[i] = top;
+            lastTop = top;
+        }
+
+        STATE.positionCache = positions;
+        STATE.positionsDirty = false;
+    }
+
+    function getMutationElement(node) {
+        if (!node) return null;
+        if (node.nodeType === Node.ELEMENT_NODE) return node;
+        return node.parentElement || null;
+    }
+
+    function isPanelMutation(node) {
+        const element = getMutationElement(node);
+        return !!(element && element.closest('#ai-toc-v2_2'));
+    }
+
+    function isRelevantMessageMutation(node) {
+        const element = getMutationElement(node);
+        if (!element || isPanelMutation(element)) return false;
+
+        if (element.matches && element.matches(CONFIG.selector)) return true;
+        if (element.querySelector && element.querySelector(CONFIG.selector)) return true;
+        if (element.closest && element.closest(CONFIG.selector)) return true;
+        return false;
+    }
+
+    function mutationAffectsMessages(mutation) {
+        if (isRelevantMessageMutation(mutation.target)) return true;
+
+        for (const node of mutation.addedNodes) {
+            if (isRelevantMessageMutation(node)) return true;
+        }
+
+        for (const node of mutation.removedNodes) {
+            if (isRelevantMessageMutation(node)) return true;
+        }
+
+        return false;
+    }
+
+    function startObserver() {
+        if (STATE.observer || !document.body) return;
+
+        STATE.observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                if (mutationAffectsMessages(mutation)) {
+                    scheduleScan();
+                    return;
+                }
+            }
+        });
+
+        STATE.observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            characterData: true
+        });
+    }
+
     function resolveMessageContainer(line) {
         if (!line) return null;
 
@@ -274,14 +388,154 @@
         return candidate;
     }
 
+    function extractImageLabel(container) {
+        if (!container) return '';
+
+        const images = Array.from(container.querySelectorAll('img'));
+        if (!images.length) return '';
+
+        const labels = [];
+        images.forEach((img) => {
+            const raw = (img.getAttribute('alt') || img.getAttribute('aria-label') || img.title || '').trim();
+            if (!raw) return;
+            if (raw.length <= 2) return;
+            if (/^(image|photo|picture)$/i.test(raw)) return;
+            labels.push(raw);
+        });
+
+        if (labels.length) {
+            return `图片：${labels[0]}`;
+        }
+
+        return images.length > 1 ? `图片 x${images.length}` : '图片';
+    }
+
+    function extractMessageLabel(line, container) {
+        const text = (line.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text) return text;
+        return extractImageLabel(container);
+    }
+
+    function getContainerSignature(element) {
+        if (!element || !element.tagName) return '';
+        const className = typeof element.className === 'string' ? element.className.trim().replace(/\s+/g, ' ') : '';
+        return `${element.tagName}|${className}`;
+    }
+
+    function collectImageOnlyMessages(knownSignatures, usedContainers) {
+        if (IS_CHATGPT) return [];
+
+        const results = [];
+        const seenContainers = new Set();
+        const images = Array.from(document.querySelectorAll('img'));
+
+        images.forEach((img) => {
+            if (!img.isConnected || isPanelMutation(img)) return;
+
+            let current = img.parentElement;
+            while (current && current !== document.body && current !== document.documentElement) {
+                const signature = getContainerSignature(current);
+                if (knownSignatures.has(signature)) {
+                    if (!current.querySelector(CONFIG.selector) && !usedContainers.has(current) && !seenContainers.has(current)) {
+                        const text = extractImageLabel(current);
+                        if (text) {
+                            results.push({
+                                container: current,
+                                anchor: img,
+                                text
+                            });
+                            seenContainers.add(current);
+                        }
+                    }
+                    return;
+                }
+                current = current.parentElement;
+            }
+        });
+
+        return results;
+    }
+
+    function compareMessageOrder(a, b) {
+        const aNode = a.anchor || a.container;
+        const bNode = b.anchor || b.container;
+        if (!aNode || !bNode || aNode === bNode) return 0;
+
+        const position = aNode.compareDocumentPosition(bNode);
+        if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+        if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+        return 0;
+    }
+
+    function scrollMessageIntoView(message) {
+        const target = message && (message.anchor || message.container);
+        if (!target || !target.isConnected) return;
+
+        const container = STATE.scrollContainer || getScrollContainer();
+        const viewport = getViewportRect(container);
+        const currentTop = getScrollTop(container);
+        const rect = target.getBoundingClientRect();
+        const offset = Math.min(160, viewport.height * 0.28);
+        const top = Math.max(0, currentTop + rect.top - viewport.top - offset);
+
+        scrollTargetTo(container, top, 'smooth');
+    }
+
     function setButtonIcon(btn, iconKey, className) {
         while (btn.firstChild) btn.removeChild(btn.firstChild);
         btn.appendChild(createIcon(iconKey, className));
     }
 
+    function ensureItemVisible(list, item) {
+        const itemTop = item.offsetTop;
+        const itemBottom = itemTop + item.offsetHeight;
+        const viewTop = list.scrollTop;
+        const viewBottom = viewTop + list.clientHeight;
+
+        if (itemTop < viewTop) {
+            list.scrollTop = itemTop;
+            return;
+        }
+
+        if (itemBottom > viewBottom) {
+            list.scrollTop = itemBottom - list.clientHeight;
+        }
+    }
+
+    function syncItemIntoView(list, item) {
+        if (!list || !item) return;
+
+        const itemTop = item.offsetTop;
+        const itemBottom = itemTop + item.offsetHeight;
+        const viewTop = list.scrollTop;
+        const viewBottom = viewTop + list.clientHeight;
+
+        if (itemTop >= viewTop && itemBottom <= viewBottom) return;
+
+        const targetTop = Math.max(0, itemTop - Math.max(0, (list.clientHeight - item.offsetHeight) / 2));
+        list.scrollTop = targetTop;
+    }
+
+    function syncTocToTopIfNeeded() {
+        const list = document.getElementById('toc-list');
+        if (!list) return;
+
+        const container = STATE.scrollContainer || getScrollContainer();
+        if (getScrollTop(container) <= 1) {
+            list.scrollTop = 0;
+        }
+    }
+
     function setActiveIndex(index) {
         const list = document.getElementById('toc-list');
         if (!list) return;
+        if (index === STATE.activeIndex) {
+            const currentItem = index >= 0 ? list.children[index] : null;
+            if (currentItem && !currentItem.classList.contains('toc-hidden')) {
+                syncItemIntoView(list, currentItem);
+            }
+            return;
+        }
 
         if (STATE.activeIndex >= 0 && list.children[STATE.activeIndex]) {
             list.children[STATE.activeIndex].classList.remove('toc-active');
@@ -293,7 +547,7 @@
         const item = list.children[index];
         item.classList.add('toc-active');
         if (!item.classList.contains('toc-hidden')) {
-            item.scrollIntoView({ block: 'nearest' });
+            syncItemIntoView(list, item);
         }
     }
 
@@ -301,32 +555,29 @@
         if (!messages.length) return -1;
 
         const container = STATE.scrollContainer || getScrollContainer();
+        if (STATE.positionsDirty || STATE.positionCache.length !== messages.length) {
+            refreshPositionCache();
+        }
+
         const viewport = getViewportRect(container);
-        const threshold = viewport.top + Math.min(160, viewport.height * 0.28);
+        const threshold = getScrollTop(container) + Math.min(160, viewport.height * 0.28);
+        const positions = STATE.positionCache;
 
-        let passedIndex = -1;
-        let nearestBelowIndex = -1;
-        let nearestBelowDistance = Number.POSITIVE_INFINITY;
+        let low = 0;
+        let high = positions.length - 1;
+        let activeIndex = -1;
 
-        for (let i = 0; i < messages.length; i++) {
-            const msg = messages[i];
-            if (!msg.container || !msg.container.isConnected) continue;
-
-            const rect = msg.container.getBoundingClientRect();
-            if (rect.top <= threshold) {
-                passedIndex = i;
+        while (low <= high) {
+            const mid = (low + high) >> 1;
+            if (positions[mid] <= threshold) {
+                activeIndex = mid;
+                low = mid + 1;
             } else {
-                const distance = rect.top - threshold;
-                if (distance < nearestBelowDistance) {
-                    nearestBelowDistance = distance;
-                    nearestBelowIndex = i;
-                }
+                high = mid - 1;
             }
         }
 
-        if (passedIndex >= 0) return passedIndex;
-        if (nearestBelowIndex >= 0) return nearestBelowIndex;
-        return messages.length - 1;
+        return activeIndex >= 0 ? activeIndex : 0;
     }
 
     function syncActiveTocItem() {
@@ -335,6 +586,7 @@
             return;
         }
         setActiveIndex(findActiveMessageIndex(STATE.messages));
+        syncTocToTopIfNeeded();
     }
 
     function scheduleActiveSync() {
@@ -355,6 +607,7 @@
 
         nextContainer.addEventListener('scroll', scheduleActiveSync, { passive: true });
         STATE.scrollContainer = nextContainer;
+        STATE.positionsDirty = true;
     }
 
     function filterList(value) {
@@ -397,6 +650,7 @@
             }
 
             lastHeight = currentHeight;
+            syncTocToTopIfNeeded();
             scheduleActiveSync();
 
             if ((stableSince && Date.now() - stableSince >= 2200) || attempts >= 240) {
@@ -470,6 +724,27 @@
 
         const list = document.createElement('ul');
         list.id = 'toc-list';
+        list.addEventListener('click', (event) => {
+            const item = event.target.closest('.toc-item');
+            if (!item || !list.contains(item)) return;
+
+            const index = Number(item.dataset.index);
+            const msg = STATE.messages[index];
+            if (!msg) return;
+
+            if ((msg.anchor && msg.anchor.isConnected) || (msg.container && msg.container.isConnected)) {
+                setActiveIndex(index);
+                scrollMessageIntoView(msg);
+            } else {
+                handleBot();
+            }
+
+            const oldBg = item.style.background;
+            item.style.background = '#444a50';
+            setTimeout(() => {
+                item.style.background = oldBg;
+            }, 300);
+        });
 
         panel.append(header, list);
         document.body.appendChild(panel);
@@ -500,36 +775,48 @@
 
         setTimeout(() => panel.classList.add('toc-visible'), 100);
         if (!STATE.resizeBound) {
-            window.addEventListener('resize', scheduleActiveSync, { passive: true });
+            window.addEventListener('resize', () => {
+                schedulePositionRefresh();
+            }, { passive: true });
             STATE.resizeBound = true;
         }
+        startObserver();
         scanContent();
     }
 
     function scanContent() {
         const list = document.getElementById('toc-list');
         if (!list) return;
+        const previousActiveIndex = STATE.activeIndex;
 
         const allLines = Array.from(document.querySelectorAll(CONFIG.selector));
         const messages = [];
         let currentGroup = null;
 
         allLines.forEach((line) => {
-            const text = (line.innerText || '').trim();
-            if (!text) return;
-
             const container = resolveMessageContainer(line);
             if (!container) return;
+            const text = extractMessageLabel(line, container);
+            if (!text) return;
 
             if (currentGroup && currentGroup.container === container) {
-                currentGroup.text += ` ${text}`;
+                if (currentGroup.text !== text) {
+                    currentGroup.text += ` ${text}`;
+                }
             } else {
                 if (currentGroup) messages.push(currentGroup);
-                currentGroup = { container, text };
+                currentGroup = { container, anchor: line, text };
             }
         });
 
         if (currentGroup) messages.push(currentGroup);
+        const usedContainers = new Set(messages.map((message) => message.container));
+        const knownSignatures = new Set(messages.map((message) => getContainerSignature(message.container)).filter(Boolean));
+        const imageOnlyMessages = collectImageOnlyMessages(knownSignatures, usedContainers);
+        if (imageOnlyMessages.length) {
+            messages.push(...imageOnlyMessages);
+            messages.sort(compareMessageOrder);
+        }
         STATE.messages = messages;
 
         const total = messages.length;
@@ -577,39 +864,38 @@
             }
 
             item.dataset.index = String(i);
-            item.onclick = () => {
-                if (msg.container && msg.container.isConnected) {
-                    setActiveIndex(i);
-                    msg.container.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                } else {
-                    handleBot();
-                }
-
-                const oldBg = item.style.background;
-                item.style.background = '#444a50';
-                setTimeout(() => {
-                    item.style.background = oldBg;
-                }, 300);
-            };
         }
 
         while (list.children.length > total) {
             list.removeChild(list.lastChild);
         }
 
+        if (previousActiveIndex >= 0 && list.children[previousActiveIndex]) {
+            list.children[previousActiveIndex].classList.remove('toc-active');
+        }
+        STATE.activeIndex = -1;
+
         const input = document.querySelector('.toc-search input');
         if (input && input.value) filterList(input.value);
 
         bindScrollSync();
+        refreshPositionCache();
         scheduleActiveSync();
     }
 
+    if (document.getElementById('ai-toc-v2_2')) {
+        startObserver();
+        scheduleScan(0);
+    } else {
+        createUI();
+    }
     setInterval(() => {
         const panel = document.getElementById('ai-toc-v2_2');
         if (!panel) {
             createUI();
-        } else {
-            scanContent();
         }
-    }, 800);
+        if (!STATE.observer) {
+            startObserver();
+        }
+    }, 2000);
 })();
