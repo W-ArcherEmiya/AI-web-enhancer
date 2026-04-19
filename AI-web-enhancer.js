@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 目录插件 (Gemini & ChatGPT)
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5.0
 // @description  生成高效的 Gemini 与 ChatGPT 对话目录索引窗口。
 // @author       ArcherEmiya
 // @match        https://gemini.google.com/*
@@ -36,16 +36,34 @@
     }
 
     cleanUpOldVersions();
-    console.log('AI TOC Plugin v2.4: started');
+    console.log('AI TOC Plugin v2.5.0: started');
 
-    const IS_CHATGPT = window.location.hostname.includes('chatgpt.com');
     const CONFIG = {
-        selector: IS_CHATGPT ? '[data-message-author-role="user"]' : '.query-text-line',
         displayCount: 8
+    };
+    const TIMINGS = {
+        scanDelay: 120,
+        positionRefresh: 80,
+        jumpCorrection: 140,
+        manualRelease: 180,
+        tocFollowPause: 900,
+        tocUserScroll: 1200,
+        topBoundaryStable: 2200,
+        bottomBoundaryStable: 600,
+        boundaryInterval: 120,
+        topBoundaryMaxAttempts: 240,
+        bottomBoundaryMaxAttempts: 120
     };
     const STATE = {
         messages: [],
         activeIndex: -1,
+        manualActiveIndex: -1,
+        clickLockIndex: -1,
+        forcedActiveIndex: -1,
+        tocUserScrollUntil: 0,
+        tocSyncing: false,
+        scrollSettleTimer: 0,
+        jumpSyncTimer: 0,
         scrollContainer: null,
         syncFrame: 0,
         resizeBound: false,
@@ -53,17 +71,211 @@
         positionTimer: 0,
         positionCache: [],
         positionsDirty: true,
-        observer: null
+        observer: null,
+        globalEventsBound: false
     };
 
     const PATHS = {
         search: 'M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z',
-        top: 'M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z',
-        bottom: 'M20 12l-1.41-1.41L13 16.17V4h-2v12.17l-5.58-5.59L4 12l8 8 8-8z',
+        top: 'M7 4h10v2H7V4zm5 3l-5 5h3v8h4v-8h3l-5-5z',
+        bottom: 'M10 4h4v8h3l-5 5-5-5h3V4zM7 18h10v2H7v-2z',
         spin: 'M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z',
         bullet: 'M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10z'
     };
 
+    // Site adapters and message collection
+    function resolveGroupedMessageContainer(line, selector) {
+        if (!line) return null;
+
+        let current = line.parentElement || line;
+        let candidate = current;
+
+        while (current && current.parentElement && current.parentElement !== document.body) {
+            const parent = current.parentElement;
+            const matchedChildren = Array.from(parent.children).filter((child) => {
+                return child.matches(selector) || !!child.querySelector(selector);
+            });
+
+            if (matchedChildren.length > 1) {
+                return current;
+            }
+
+            candidate = current;
+            current = parent;
+        }
+
+        return candidate;
+    }
+
+    function extractImageLabel(container) {
+        if (!container) return '';
+
+        const images = Array.from(container.querySelectorAll('img'));
+        if (!images.length) return '';
+
+        const labels = [];
+        images.forEach((img) => {
+            const raw = (img.getAttribute('alt') || img.getAttribute('aria-label') || img.title || '').trim();
+            if (!raw) return;
+            if (raw.length <= 2) return;
+            if (/^(image|photo|picture)$/i.test(raw)) return;
+            labels.push(raw);
+        });
+
+        if (labels.length) {
+            return `图片：${labels[0]}`;
+        }
+
+        return images.length > 1 ? `图片 x${images.length}` : '图片';
+    }
+
+    function normalizeMessageText(node) {
+        return (node && node.textContent ? node.textContent : '').replace(/\s+/g, ' ').trim();
+    }
+
+    function collectMessagesFromAdapter(adapter) {
+        const allLines = Array.from(document.querySelectorAll(adapter.selector));
+        const messages = [];
+        let currentGroup = null;
+
+        allLines.forEach((line) => {
+            const container = adapter.resolveMessageContainer(line);
+            if (!container) return;
+
+            const text = adapter.getMessageLabel(line, container);
+            if (!text) return;
+
+            if (currentGroup && currentGroup.container === container) {
+                if (currentGroup.text !== text) {
+                    currentGroup.text += ` ${text}`;
+                }
+                return;
+            }
+
+            if (currentGroup) messages.push(currentGroup);
+            currentGroup = { container, anchor: line, text };
+        });
+
+        if (currentGroup) messages.push(currentGroup);
+
+        const usedContainers = new Set(messages.map((message) => message.container));
+        const knownSignatures = new Set(messages.map((message) => getContainerSignature(message.container)).filter(Boolean));
+        const extraMessages = adapter.collectExtraMessages(knownSignatures, usedContainers, isPanelMutation) || [];
+
+        if (extraMessages.length) {
+            messages.push(...extraMessages);
+            messages.sort(compareMessageOrder);
+        }
+
+        return messages;
+    }
+
+    function getMessageTarget(message) {
+        return message ? (message.anchor || message.container) : null;
+    }
+
+    function isMessageConnected(message) {
+        const target = getMessageTarget(message);
+        return !!(target && target.isConnected);
+    }
+
+    function getDefaultScrollReferenceTargets(messages, selector) {
+        if (messages.length) {
+            return [
+                getMessageTarget(messages[0]),
+                getMessageTarget(messages[(messages.length - 1) >> 1]),
+                getMessageTarget(messages[messages.length - 1])
+            ].filter(Boolean);
+        }
+
+        const fallback = document.querySelector(selector);
+        return fallback ? [fallback] : [];
+    }
+
+    const SITE_ADAPTERS = {
+        chatgpt: {
+            id: 'chatgpt',
+            title: 'ChatGPT 索引',
+            selector: '[data-message-author-role="user"]',
+            matches() {
+                return window.location.hostname.includes('chatgpt.com');
+            },
+            resolveMessageContainer(line) {
+                return line.closest('[data-message-author-role]') || resolveGroupedMessageContainer(line, this.selector);
+            },
+            getMessageLabel(line, container) {
+                const text = normalizeMessageText(line);
+                return text || extractImageLabel(container);
+            },
+            getScrollReferenceTargets(messages) {
+                return getDefaultScrollReferenceTargets(messages, this.selector);
+            },
+            collectExtraMessages() {
+                return [];
+            }
+        },
+        gemini: {
+            id: 'gemini',
+            title: 'Gemini 索引',
+            selector: '.query-text-line',
+            matches() {
+                return window.location.hostname.includes('gemini.google.com');
+            },
+            resolveMessageContainer(line) {
+                return resolveGroupedMessageContainer(line, this.selector);
+            },
+            getMessageLabel(line, container) {
+                const text = normalizeMessageText(line);
+                return text || extractImageLabel(container);
+            },
+            getScrollReferenceTargets(messages) {
+                return getDefaultScrollReferenceTargets(messages, this.selector);
+            },
+            collectExtraMessages(knownSignatures, usedContainers, isPanelMutationFn) {
+                const results = [];
+                const seenContainers = new Set();
+                const images = Array.from(document.querySelectorAll('img'));
+
+                images.forEach((img) => {
+                    if (!img.isConnected || isPanelMutationFn(img)) return;
+
+                    let current = img.parentElement;
+                    while (current && current !== document.body && current !== document.documentElement) {
+                        const signature = getContainerSignature(current);
+                        if (knownSignatures.has(signature)) {
+                            if (!current.querySelector(this.selector) && !usedContainers.has(current) && !seenContainers.has(current)) {
+                                const text = extractImageLabel(current);
+                                if (text) {
+                                    results.push({
+                                        container: current,
+                                        anchor: img,
+                                        text
+                                    });
+                                    seenContainers.add(current);
+                                }
+                            }
+                            return;
+                        }
+                        current = current.parentElement;
+                    }
+                });
+
+                return results;
+            }
+        }
+    };
+
+    function selectAdapter() {
+        const adapters = Object.values(SITE_ADAPTERS);
+        for (let i = 0; i < adapters.length; i++) {
+            if (adapters[i].matches()) return adapters[i];
+        }
+        return SITE_ADAPTERS.gemini;
+    }
+
+    const ADAPTER = selectAdapter();
+
+    // Shared DOM and scroll utilities
     function createIcon(key, className) {
         const svgNS = 'http://www.w3.org/2000/svg';
         const svg = document.createElementNS(svgNS, 'svg');
@@ -218,6 +430,31 @@
         return isWindowScrollTarget(target) ? getPageScroller().scrollHeight : target.scrollHeight;
     }
 
+    function getScrollMaxTop(target) {
+        if (isWindowScrollTarget(target)) {
+            return Math.max(0, getPageScroller().scrollHeight - window.innerHeight);
+        }
+        return Math.max(0, target.scrollHeight - target.clientHeight);
+    }
+
+    function getScrollableAncestors(element) {
+        const ancestors = [];
+        let current = element;
+
+        while (current && current !== document.body && current !== document.documentElement) {
+            if (isScrollableElement(current)) {
+                ancestors.push(current);
+            }
+            current = current.parentElement;
+        }
+
+        if (getScrollMaxTop(window) > 0) {
+            ancestors.push(window);
+        }
+
+        return ancestors;
+    }
+
     function getViewportRect(target) {
         if (isWindowScrollTarget(target)) {
             return { top: 0, bottom: window.innerHeight, height: window.innerHeight };
@@ -227,28 +464,69 @@
     }
 
     function scrollTargetTo(target, top, behavior) {
+        const nextTop = Math.max(0, Math.min(typeof top === 'number' ? top : 0, getScrollMaxTop(target)));
         if (isWindowScrollTarget(target)) {
-            window.scrollTo({ top, behavior });
+            window.scrollTo({ top: nextTop, behavior });
             return;
         }
 
         if (typeof target.scrollTo === 'function') {
-            target.scrollTo({ top, behavior });
+            target.scrollTo({ top: nextTop, behavior });
         } else {
-            target.scrollTop = top;
+            target.scrollTop = nextTop;
         }
     }
 
-    function getScrollContainer() {
-        const anchor = document.querySelector(CONFIG.selector);
-        if (!anchor) return window;
+    function findScrollContainerForElement(element) {
+        const ancestors = getScrollableAncestors(element);
+        if (!ancestors.length) return window;
 
-        let current = anchor;
-        while (current && current !== document.body && current !== document.documentElement) {
-            if (isScrollableElement(current)) return current;
-            current = current.parentElement;
+        let best = ancestors[0];
+        let bestRange = getScrollMaxTop(best);
+
+        for (let i = 1; i < ancestors.length; i++) {
+            const candidate = ancestors[i];
+            const range = getScrollMaxTop(candidate);
+            if (range >= bestRange) {
+                best = candidate;
+                bestRange = range;
+            }
         }
-        return window;
+
+        return best;
+    }
+
+    function getScrollContainer() {
+        const sampleTargets = ADAPTER.getScrollReferenceTargets(STATE.messages);
+        const stats = new Map();
+        sampleTargets.forEach((target) => {
+            if (!target) return;
+            getScrollableAncestors(target).forEach((ancestor, index) => {
+                const current = stats.get(ancestor) || { count: 0, range: 0, depth: index };
+                current.count += 1;
+                current.range = Math.max(current.range, getScrollMaxTop(ancestor));
+                current.depth = Math.min(current.depth, index);
+                stats.set(ancestor, current);
+            });
+        });
+
+        if (!stats.size) return window;
+
+        let best = window;
+        let bestStats = { count: -1, range: -1, depth: Infinity };
+
+        stats.forEach((value, key) => {
+            if (
+                value.count > bestStats.count ||
+                (value.count === bestStats.count && value.range > bestStats.range) ||
+                (value.count === bestStats.count && value.range === bestStats.range && value.depth < bestStats.depth)
+            ) {
+                best = key;
+                bestStats = value;
+            }
+        });
+
+        return best;
     }
 
     function scheduleScan(delay) {
@@ -258,7 +536,7 @@
         STATE.scanTimer = window.setTimeout(() => {
             STATE.scanTimer = 0;
             scanContent();
-        }, typeof delay === 'number' ? delay : 120);
+        }, typeof delay === 'number' ? delay : TIMINGS.scanDelay);
     }
 
     function schedulePositionRefresh() {
@@ -271,7 +549,7 @@
                 refreshPositionCache();
                 scheduleActiveSync();
             }
-        }, 80);
+        }, TIMINGS.positionRefresh);
     }
 
     function refreshPositionCache() {
@@ -282,15 +560,14 @@
             return;
         }
 
-        const container = STATE.scrollContainer || getScrollContainer();
+        const container = getActiveScrollContainer();
         const viewportTop = getViewportRect(container).top;
         const scrollTop = getScrollTop(container);
         const positions = new Array(messages.length);
         let lastTop = 0;
 
         for (let i = 0; i < messages.length; i++) {
-            const message = messages[i];
-            const anchor = message.anchor || message.container;
+            const anchor = getMessageTarget(messages[i]);
             if (!anchor || !anchor.isConnected) {
                 positions[i] = lastTop;
                 continue;
@@ -306,6 +583,19 @@
         STATE.positionsDirty = false;
     }
 
+    function getActiveScrollContainer() {
+        return STATE.scrollContainer || getScrollContainer();
+    }
+
+    function getLastMessageIndex() {
+        return Math.max(0, STATE.messages.length - 1);
+    }
+
+    function clampMessageIndex(index) {
+        return Math.min(index, getLastMessageIndex());
+    }
+
+    // DOM observation and message ordering
     function getMutationElement(node) {
         if (!node) return null;
         if (node.nodeType === Node.ELEMENT_NODE) return node;
@@ -321,9 +611,9 @@
         const element = getMutationElement(node);
         if (!element || isPanelMutation(element)) return false;
 
-        if (element.matches && element.matches(CONFIG.selector)) return true;
-        if (element.querySelector && element.querySelector(CONFIG.selector)) return true;
-        if (element.closest && element.closest(CONFIG.selector)) return true;
+        if (element.matches && element.matches(ADAPTER.selector)) return true;
+        if (element.querySelector && element.querySelector(ADAPTER.selector)) return true;
+        if (element.closest && element.closest(ADAPTER.selector)) return true;
         return false;
     }
 
@@ -360,105 +650,15 @@
         });
     }
 
-    function resolveMessageContainer(line) {
-        if (!line) return null;
-
-        if (IS_CHATGPT) {
-            const direct = line.closest('[data-message-author-role]');
-            if (direct) return direct;
-        }
-
-        let current = line.parentElement || line;
-        let candidate = current;
-
-        while (current && current.parentElement && current.parentElement !== document.body) {
-            const parent = current.parentElement;
-            const matchedChildren = Array.from(parent.children).filter((child) => {
-                return child.matches(CONFIG.selector) || !!child.querySelector(CONFIG.selector);
-            });
-
-            if (matchedChildren.length > 1) {
-                return current;
-            }
-
-            candidate = current;
-            current = parent;
-        }
-
-        return candidate;
-    }
-
-    function extractImageLabel(container) {
-        if (!container) return '';
-
-        const images = Array.from(container.querySelectorAll('img'));
-        if (!images.length) return '';
-
-        const labels = [];
-        images.forEach((img) => {
-            const raw = (img.getAttribute('alt') || img.getAttribute('aria-label') || img.title || '').trim();
-            if (!raw) return;
-            if (raw.length <= 2) return;
-            if (/^(image|photo|picture)$/i.test(raw)) return;
-            labels.push(raw);
-        });
-
-        if (labels.length) {
-            return `图片：${labels[0]}`;
-        }
-
-        return images.length > 1 ? `图片 x${images.length}` : '图片';
-    }
-
-    function extractMessageLabel(line, container) {
-        const text = (line.textContent || '').replace(/\s+/g, ' ').trim();
-        if (text) return text;
-        return extractImageLabel(container);
-    }
-
     function getContainerSignature(element) {
         if (!element || !element.tagName) return '';
         const className = typeof element.className === 'string' ? element.className.trim().replace(/\s+/g, ' ') : '';
         return `${element.tagName}|${className}`;
     }
 
-    function collectImageOnlyMessages(knownSignatures, usedContainers) {
-        if (IS_CHATGPT) return [];
-
-        const results = [];
-        const seenContainers = new Set();
-        const images = Array.from(document.querySelectorAll('img'));
-
-        images.forEach((img) => {
-            if (!img.isConnected || isPanelMutation(img)) return;
-
-            let current = img.parentElement;
-            while (current && current !== document.body && current !== document.documentElement) {
-                const signature = getContainerSignature(current);
-                if (knownSignatures.has(signature)) {
-                    if (!current.querySelector(CONFIG.selector) && !usedContainers.has(current) && !seenContainers.has(current)) {
-                        const text = extractImageLabel(current);
-                        if (text) {
-                            results.push({
-                                container: current,
-                                anchor: img,
-                                text
-                            });
-                            seenContainers.add(current);
-                        }
-                    }
-                    return;
-                }
-                current = current.parentElement;
-            }
-        });
-
-        return results;
-    }
-
     function compareMessageOrder(a, b) {
-        const aNode = a.anchor || a.container;
-        const bNode = b.anchor || b.container;
+        const aNode = getMessageTarget(a);
+        const bNode = getMessageTarget(b);
         if (!aNode || !bNode || aNode === bNode) return 0;
 
         const position = aNode.compareDocumentPosition(bNode);
@@ -467,18 +667,200 @@
         return 0;
     }
 
-    function scrollMessageIntoView(message) {
-        const target = message && (message.anchor || message.container);
+    function getElementScrollTop(target, container) {
         if (!target || !target.isConnected) return;
-
-        const container = STATE.scrollContainer || getScrollContainer();
         const viewport = getViewportRect(container);
         const currentTop = getScrollTop(container);
         const rect = target.getBoundingClientRect();
         const offset = Math.min(160, viewport.height * 0.28);
-        const top = Math.max(0, currentTop + rect.top - viewport.top - offset);
+        const activationBias = 24;
+        return Math.max(0, Math.min(currentTop + rect.top - viewport.top - offset + activationBias, getScrollMaxTop(container)));
+    }
 
-        scrollTargetTo(container, top, 'smooth');
+    function getMessageScrollTopByIndex(index, container) {
+        if (index < 0 || index >= STATE.messages.length) return;
+
+        const message = STATE.messages[index];
+        const target = getMessageTarget(message);
+        if (!target || !target.isConnected) return;
+
+        const viewport = getViewportRect(container);
+        const currentTop = getScrollTop(container);
+        const rect = target.getBoundingClientRect();
+        const absoluteTop = currentTop + rect.top - viewport.top;
+        const offset = Math.min(160, viewport.height * 0.28);
+
+        let thresholdOffset = 28;
+        if (index < STATE.messages.length - 1) {
+            const nextMessage = STATE.messages[index + 1];
+            const nextTarget = getMessageTarget(nextMessage);
+            if (nextTarget && nextTarget.isConnected) {
+                const nextRect = nextTarget.getBoundingClientRect();
+                const nextAbsoluteTop = currentTop + nextRect.top - viewport.top;
+                const gap = Math.max(0, nextAbsoluteTop - absoluteTop);
+                thresholdOffset = Math.min(64, Math.max(28, gap * 0.25));
+            }
+        }
+
+        return Math.max(0, Math.min(absoluteTop + thresholdOffset - offset, getScrollMaxTop(container)));
+    }
+
+    // Navigation and active-item state
+    function resolveTargetScrollTop(target, container, index) {
+        return typeof index === 'number'
+            ? getMessageScrollTopByIndex(index, container)
+            : getElementScrollTop(target, container);
+    }
+
+    function clearJumpSyncTimer() {
+        if (STATE.jumpSyncTimer) {
+            window.clearTimeout(STATE.jumpSyncTimer);
+            STATE.jumpSyncTimer = 0;
+        }
+    }
+
+    function scheduleJumpCorrection(target, remainingAttempts, index) {
+        clearJumpSyncTimer();
+        if (!target || !target.isConnected || remainingAttempts <= 0) return;
+
+        STATE.jumpSyncTimer = window.setTimeout(() => {
+            STATE.jumpSyncTimer = 0;
+            const currentContainer = findScrollContainerForElement(target);
+            if (STATE.scrollContainer !== currentContainer) bindScrollSync();
+
+            const exactTop = resolveTargetScrollTop(target, currentContainer, index);
+            if (typeof exactTop !== 'number') return;
+
+            const currentTop = getScrollTop(currentContainer);
+            if (Math.abs(currentTop - exactTop) > 4) {
+                scrollTargetTo(currentContainer, exactTop, 'auto');
+            }
+
+            scheduleActiveSync();
+            scheduleJumpCorrection(target, remainingAttempts - 1, index);
+        }, TIMINGS.jumpCorrection);
+    }
+
+    function scrollMessageIntoView(message, index) {
+        const target = getMessageTarget(message);
+        if (!target || !target.isConnected) return;
+
+        const container = findScrollContainerForElement(target);
+        if (STATE.scrollContainer !== container) bindScrollSync();
+
+        const initialTop = resolveTargetScrollTop(target, container, index);
+        if (typeof initialTop !== 'number') return;
+
+        scrollTargetTo(container, initialTop, 'smooth');
+        scheduleJumpCorrection(target, 4, index);
+    }
+
+    function holdManualActiveIndex(index, duration) {
+        STATE.manualActiveIndex = index;
+        scheduleManualActiveRelease(typeof duration === 'number' ? duration : TIMINGS.manualRelease);
+    }
+
+    function clearManualActiveIndex() {
+        STATE.manualActiveIndex = -1;
+        if (STATE.scrollSettleTimer) {
+            window.clearTimeout(STATE.scrollSettleTimer);
+            STATE.scrollSettleTimer = 0;
+        }
+    }
+
+    function cancelClickNavigationTracking() {
+        STATE.clickLockIndex = -1;
+        clearManualActiveIndex();
+        clearJumpSyncTimer();
+    }
+
+    function beginForcedBoundaryNavigation(index) {
+        cancelClickNavigationTracking();
+        STATE.forcedActiveIndex = index;
+    }
+
+    function finishForcedBoundaryNavigation(btn, iconKey) {
+        btn.disabled = false;
+        setButtonIcon(btn, iconKey);
+        STATE.forcedActiveIndex = -1;
+        clearManualActiveIndex();
+        scanContent();
+    }
+
+    function getActiveThreshold(container) {
+        const viewport = getViewportRect(container);
+        return getScrollTop(container) + Math.min(160, viewport.height * 0.28);
+    }
+
+    function isIndexAligned(index, container) {
+        if (index < 0 || index >= STATE.messages.length) return false;
+
+        if (STATE.positionsDirty || STATE.positionCache.length !== STATE.messages.length) {
+            refreshPositionCache();
+        }
+
+        const positions = STATE.positionCache;
+        const threshold = getActiveThreshold(container);
+        const currentTop = positions[index];
+        const nextTop = index < positions.length - 1 ? positions[index + 1] : Infinity;
+        const tolerance = 12;
+
+        return currentTop <= threshold + tolerance && nextTop > threshold - tolerance;
+    }
+
+    function scheduleManualActiveRelease(delay) {
+        if (STATE.scrollSettleTimer) {
+            window.clearTimeout(STATE.scrollSettleTimer);
+        }
+        STATE.scrollSettleTimer = window.setTimeout(() => {
+            STATE.scrollSettleTimer = 0;
+
+            if (STATE.manualActiveIndex >= 0) {
+                const manualIndex = clampMessageIndex(STATE.manualActiveIndex);
+                const targetMessage = STATE.messages[manualIndex];
+                const target = getMessageTarget(targetMessage);
+                if (target && target.isConnected) {
+                    const currentContainer = findScrollContainerForElement(target);
+                    const exactTop = getMessageScrollTopByIndex(manualIndex, currentContainer);
+                    const aligned = isIndexAligned(manualIndex, currentContainer);
+                    if (typeof exactTop === 'number' && (Math.abs(getScrollTop(currentContainer) - exactTop) > 4 || !aligned)) {
+                        scrollTargetTo(currentContainer, exactTop, 'auto');
+                        scheduleManualActiveRelease(TIMINGS.manualRelease);
+                        scheduleActiveSync();
+                        return;
+                    }
+                }
+            }
+
+            clearManualActiveIndex();
+            scheduleActiveSync();
+        }, typeof delay === 'number' ? delay : TIMINGS.manualRelease);
+    }
+
+    function resolveActiveIndex(index) {
+        if (STATE.forcedActiveIndex >= 0) {
+            return clampMessageIndex(STATE.forcedActiveIndex);
+        }
+        if (STATE.clickLockIndex >= 0) {
+            return clampMessageIndex(STATE.clickLockIndex);
+        }
+        if (STATE.manualActiveIndex < 0) return index;
+
+        const manualIndex = clampMessageIndex(STATE.manualActiveIndex);
+        const container = getActiveScrollContainer();
+        if (isIndexAligned(manualIndex, container)) {
+            clearManualActiveIndex();
+            return manualIndex;
+        }
+
+        return manualIndex;
+    }
+
+    function handleScrollSync() {
+        if (STATE.manualActiveIndex >= 0) {
+            scheduleManualActiveRelease(TIMINGS.manualRelease);
+        }
+        scheduleActiveSync();
     }
 
     function setButtonIcon(btn, iconKey, className) {
@@ -486,24 +868,33 @@
         btn.appendChild(createIcon(iconKey, className));
     }
 
-    function ensureItemVisible(list, item) {
-        const itemTop = item.offsetTop;
-        const itemBottom = itemTop + item.offsetHeight;
-        const viewTop = list.scrollTop;
-        const viewBottom = viewTop + list.clientHeight;
+    function markTocUserScroll(duration) {
+        STATE.tocUserScrollUntil = Date.now() + (typeof duration === 'number' ? duration : TIMINGS.tocFollowPause);
+    }
 
-        if (itemTop < viewTop) {
-            list.scrollTop = itemTop;
-            return;
-        }
+    function shouldPauseTocFollow() {
+        return Date.now() < STATE.tocUserScrollUntil;
+    }
 
-        if (itemBottom > viewBottom) {
-            list.scrollTop = itemBottom - list.clientHeight;
-        }
+    function getTocList() {
+        return document.getElementById('toc-list');
+    }
+
+    function getPanelElement() {
+        return document.getElementById('ai-toc-v2_2');
+    }
+
+    function setTocListScrollTop(list, top) {
+        STATE.tocSyncing = true;
+        list.scrollTop = top;
+        window.setTimeout(() => {
+            STATE.tocSyncing = false;
+        }, 0);
     }
 
     function syncItemIntoView(list, item) {
         if (!list || !item) return;
+        if (shouldPauseTocFollow()) return;
 
         const itemTop = item.offsetTop;
         const itemBottom = itemTop + item.offsetHeight;
@@ -513,21 +904,22 @@
         if (itemTop >= viewTop && itemBottom <= viewBottom) return;
 
         const targetTop = Math.max(0, itemTop - Math.max(0, (list.clientHeight - item.offsetHeight) / 2));
-        list.scrollTop = targetTop;
+        setTocListScrollTop(list, targetTop);
     }
 
     function syncTocToTopIfNeeded() {
-        const list = document.getElementById('toc-list');
+        const list = getTocList();
         if (!list) return;
+        if (shouldPauseTocFollow()) return;
 
-        const container = STATE.scrollContainer || getScrollContainer();
+        const container = getActiveScrollContainer();
         if (getScrollTop(container) <= 1) {
-            list.scrollTop = 0;
+            setTocListScrollTop(list, 0);
         }
     }
 
     function setActiveIndex(index) {
-        const list = document.getElementById('toc-list');
+        const list = getTocList();
         if (!list) return;
         if (index === STATE.activeIndex) {
             const currentItem = index >= 0 ? list.children[index] : null;
@@ -554,7 +946,7 @@
     function findActiveMessageIndex(messages) {
         if (!messages.length) return -1;
 
-        const container = STATE.scrollContainer || getScrollContainer();
+        const container = getActiveScrollContainer();
         if (STATE.positionsDirty || STATE.positionCache.length !== messages.length) {
             refreshPositionCache();
         }
@@ -585,7 +977,7 @@
             setActiveIndex(-1);
             return;
         }
-        setActiveIndex(findActiveMessageIndex(STATE.messages));
+        setActiveIndex(resolveActiveIndex(findActiveMessageIndex(STATE.messages)));
         syncTocToTopIfNeeded();
     }
 
@@ -597,15 +989,16 @@
         });
     }
 
+    // TOC interactions and global input handling
     function bindScrollSync() {
         const nextContainer = getScrollContainer();
         if (STATE.scrollContainer === nextContainer) return;
 
         if (STATE.scrollContainer) {
-            STATE.scrollContainer.removeEventListener('scroll', scheduleActiveSync);
+            STATE.scrollContainer.removeEventListener('scroll', handleScrollSync);
         }
 
-        nextContainer.addEventListener('scroll', scheduleActiveSync, { passive: true });
+        nextContainer.addEventListener('scroll', handleScrollSync, { passive: true });
         STATE.scrollContainer = nextContainer;
         STATE.positionsDirty = true;
     }
@@ -619,10 +1012,151 @@
         });
     }
 
-    function handleTop() {
-        const btn = this;
+    function handleSearchInput(event) {
+        filterList(event.target.value);
+    }
+
+    function handleTocUserWheel() {
+        markTocUserScroll(TIMINGS.tocUserScroll);
+    }
+
+    function handleTocListScroll() {
+        if (!STATE.tocSyncing) {
+            markTocUserScroll(TIMINGS.tocUserScroll);
+        }
+    }
+
+    function triggerBottomBoundaryNavigation() {
+        const panel = getPanelElement();
+        const buttons = panel ? panel.querySelectorAll('.toc-btn') : null;
+        const bottomButton = buttons && buttons.length > 1 ? buttons[1] : null;
+        if (bottomButton) {
+            handleBot.call(bottomButton);
+        }
+    }
+
+    function handleTocItemClick(event, list) {
+        const item = event.target.closest('.toc-item');
+        if (!item || !list.contains(item)) return;
+
+        const index = Number(item.dataset.index);
+        const msg = STATE.messages[index];
+        if (!msg) return;
+
+        if (isMessageConnected(msg)) {
+            STATE.clickLockIndex = index;
+            setActiveIndex(index);
+            holdManualActiveIndex(index);
+            scrollMessageIntoView(msg, index);
+            return;
+        }
+
+        triggerBottomBoundaryNavigation();
+    }
+
+    function bindTocListInteractions(list) {
+        list.addEventListener('wheel', handleTocUserWheel, { passive: true });
+        list.addEventListener('touchmove', handleTocUserWheel, { passive: true });
+        list.addEventListener('scroll', handleTocListScroll, { passive: true });
+        list.addEventListener('click', (event) => handleTocItemClick(event, list));
+    }
+
+    function shouldIgnoreNavigationRelease(event) {
+        const panel = getPanelElement();
+        return !!(panel && event.target && panel.contains(event.target));
+    }
+
+    function shouldReleaseNavigationForKey(event) {
+        const navKeys = ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '];
+        return navKeys.includes(event.key);
+    }
+
+    function hasNavigationTracking() {
+        return STATE.clickLockIndex >= 0 || STATE.manualActiveIndex >= 0 || !!STATE.jumpSyncTimer;
+    }
+
+    function handleNavigationReleaseEvent(event) {
+        if (!hasNavigationTracking()) return;
+        if (shouldIgnoreNavigationRelease(event)) return;
+        if (event.type === 'keydown' && !shouldReleaseNavigationForKey(event)) return;
+
+        cancelClickNavigationTracking();
+        scheduleActiveSync();
+    }
+
+    function bindGlobalInteractionEvents() {
+        if (STATE.globalEventsBound) return;
+
+        window.addEventListener('wheel', handleNavigationReleaseEvent, { passive: true });
+        window.addEventListener('touchmove', handleNavigationReleaseEvent, { passive: true });
+        window.addEventListener('pointerdown', handleNavigationReleaseEvent, { passive: true });
+        window.addEventListener('keydown', handleNavigationReleaseEvent);
+        STATE.globalEventsBound = true;
+    }
+
+    function handleHeaderDragStart(event, panel) {
+        if (event.target.tagName === 'INPUT' || event.target.closest('button')) return;
+
+        const startX = event.clientX;
+        const startY = event.clientY;
+        const rect = panel.getBoundingClientRect();
+        const startLeft = rect.left;
+        const startTop = rect.top;
+
+        function onMove(moveEvent) {
+            panel.style.left = `${startLeft + (moveEvent.clientX - startX)}px`;
+            panel.style.top = `${startTop + (moveEvent.clientY - startY)}px`;
+            panel.style.right = 'auto';
+        }
+
+        function onUp() {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+        }
+
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+    }
+
+    function bindPanelDrag(panel, header) {
+        header.addEventListener('mousedown', (event) => handleHeaderDragStart(event, panel));
+    }
+
+    function bindWindowResizeRefresh() {
+        if (STATE.resizeBound) return;
+
+        window.addEventListener('resize', () => {
+            schedulePositionRefresh();
+        }, { passive: true });
+        STATE.resizeBound = true;
+    }
+
+    function normalizeBoundaryScrollOptions(options) {
+        return Object.assign({
+            initialForcedIndex: -1,
+            intervalMs: TIMINGS.boundaryInterval,
+            onStart() {},
+            getTargetTop() {},
+            onHeightChange() {},
+            isStable() {
+                return false;
+            },
+            onTick() {}
+        }, options);
+    }
+
+    function runBoundaryScroll(btn, options) {
+        const resolvedOptions = normalizeBoundaryScrollOptions(options);
         btn.disabled = true;
         setButtonIcon(btn, 'spin', 'toc-spin');
+
+        const initialForcedIndex = resolvedOptions.initialForcedIndex;
+        if (initialForcedIndex >= 0) {
+            beginForcedBoundaryNavigation(initialForcedIndex);
+            setActiveIndex(initialForcedIndex);
+        }
+
+        resolvedOptions.onStart();
 
         let attempts = 0;
         let stableSince = 0;
@@ -633,80 +1167,133 @@
             const container = getScrollContainer();
             if (STATE.scrollContainer !== container) bindScrollSync();
 
-            scrollTargetTo(container, 0, 'auto');
-
-            const currentTop = getScrollTop(container);
             const currentHeight = getScrollHeight(container);
             const heightChanged = currentHeight !== lastHeight;
 
-            if (heightChanged) {
-                scanContent();
+            const nextTop = resolvedOptions.getTargetTop(container);
+            if (typeof nextTop === 'number') {
+                scrollTargetTo(container, nextTop, 'auto');
             }
 
-            if (currentTop <= 1 && !heightChanged) {
+            if (heightChanged) {
+                resolvedOptions.onHeightChange(container, currentHeight);
+            }
+
+            const isStable = resolvedOptions.isStable(container, heightChanged, currentHeight);
+
+            if (isStable) {
                 if (!stableSince) stableSince = Date.now();
             } else {
                 stableSince = 0;
             }
 
             lastHeight = currentHeight;
-            syncTocToTopIfNeeded();
-            scheduleActiveSync();
 
-            if ((stableSince && Date.now() - stableSince >= 2200) || attempts >= 240) {
+            resolvedOptions.onTick(container, heightChanged, currentHeight);
+
+            if ((stableSince && Date.now() - stableSince >= resolvedOptions.stableMs) || attempts >= resolvedOptions.maxAttempts) {
                 clearInterval(timer);
-                btn.disabled = false;
-                setButtonIcon(btn, 'top');
-                scanContent();
+                finishForcedBoundaryNavigation(btn, resolvedOptions.iconKey);
             }
-        }, 120);
+        }, resolvedOptions.intervalMs);
+    }
+
+    // Boundary navigation actions
+    function createTopBoundaryScrollOptions() {
+        return {
+            iconKey: 'top',
+            initialForcedIndex: 0,
+            stableMs: TIMINGS.topBoundaryStable,
+            maxAttempts: TIMINGS.topBoundaryMaxAttempts,
+            getTargetTop() {
+                return 0;
+            },
+            onStart() {
+                syncTocToTopIfNeeded();
+            },
+            onHeightChange() {
+                scanContent();
+            },
+            isStable(container, heightChanged) {
+                return getScrollTop(container) <= 1 && !heightChanged;
+            },
+            onTick() {
+                syncTocToTopIfNeeded();
+                scheduleActiveSync();
+            }
+        };
+    }
+
+    function createBottomBoundaryScrollOptions() {
+        return {
+            iconKey: 'bottom',
+            initialForcedIndex: getLastMessageIndex(),
+            stableMs: TIMINGS.bottomBoundaryStable,
+            maxAttempts: TIMINGS.bottomBoundaryMaxAttempts,
+            getTargetTop(container) {
+                return getScrollMaxTop(container);
+            },
+            onHeightChange() {
+                scanContent();
+                STATE.forcedActiveIndex = getLastMessageIndex();
+            },
+            isStable(container, heightChanged) {
+                const maxTop = getScrollMaxTop(container);
+                return Math.abs(getScrollTop(container) - maxTop) <= 1 && !heightChanged;
+            },
+            onTick() {
+                scheduleActiveSync();
+            }
+        };
+    }
+
+    function handleTop() {
+        runBoundaryScroll(this, createTopBoundaryScrollOptions());
     }
 
     function handleBot() {
-        const container = getScrollContainer();
-        scrollTargetTo(container, getScrollHeight(container), 'smooth');
+        runBoundaryScroll(this, createBottomBoundaryScrollOptions());
     }
 
-    function createUI() {
-        if (document.getElementById('ai-toc-v2_2')) return;
-        if (!document.body) return;
-
-        injectStyles();
-
+    // UI builders and TOC rendering
+    function createPanelElement() {
         const panel = document.createElement('div');
         panel.id = 'ai-toc-v2_2';
         panel.className = 'notranslate';
         panel.setAttribute('translate', 'no');
+        return panel;
+    }
 
-        const header = document.createElement('div');
-        header.className = 'toc-header';
+    function createActionButton(title, iconKey, handler) {
+        const button = document.createElement('button');
+        button.className = 'toc-btn';
+        button.title = title;
+        button.appendChild(createIcon(iconKey));
+        button.onclick = handler;
+        return button;
+    }
 
+    function createHeaderRow() {
         const row = document.createElement('div');
         row.className = 'toc-row';
 
         const title = document.createElement('span');
         title.className = 'toc-title';
-        title.textContent = IS_CHATGPT ? 'ChatGPT 索引' : 'Gemini 索引';
+        title.textContent = ADAPTER.title;
 
         const btnGroup = document.createElement('div');
         btnGroup.style.display = 'flex';
         btnGroup.style.gap = '4px';
+        btnGroup.append(
+            createActionButton('回到顶部', 'top', handleTop),
+            createActionButton('直达底部', 'bottom', handleBot)
+        );
 
-        const topBtn = document.createElement('button');
-        topBtn.className = 'toc-btn';
-        topBtn.title = '回到顶部';
-        topBtn.appendChild(createIcon('top'));
-        topBtn.onclick = handleTop;
-
-        const botBtn = document.createElement('button');
-        botBtn.className = 'toc-btn';
-        botBtn.title = '直达底部';
-        botBtn.appendChild(createIcon('bottom'));
-        botBtn.onclick = handleBot;
-
-        btnGroup.append(topBtn, botBtn);
         row.append(title, btnGroup);
+        return row;
+    }
 
+    function createSearchSection() {
         const searchDiv = document.createElement('div');
         searchDiv.className = 'toc-search';
 
@@ -717,185 +1304,183 @@
         const input = document.createElement('input');
         input.type = 'text';
         input.placeholder = '搜索...';
-        input.addEventListener('input', (event) => filterList(event.target.value));
+        input.addEventListener('input', handleSearchInput);
 
         searchDiv.append(searchIcon, input);
-        header.append(row, searchDiv);
-
-        const list = document.createElement('ul');
-        list.id = 'toc-list';
-        list.addEventListener('click', (event) => {
-            const item = event.target.closest('.toc-item');
-            if (!item || !list.contains(item)) return;
-
-            const index = Number(item.dataset.index);
-            const msg = STATE.messages[index];
-            if (!msg) return;
-
-            if ((msg.anchor && msg.anchor.isConnected) || (msg.container && msg.container.isConnected)) {
-                setActiveIndex(index);
-                scrollMessageIntoView(msg);
-            } else {
-                handleBot();
-            }
-
-            const oldBg = item.style.background;
-            item.style.background = '#444a50';
-            setTimeout(() => {
-                item.style.background = oldBg;
-            }, 300);
-        });
-
-        panel.append(header, list);
-        document.body.appendChild(panel);
-
-        header.addEventListener('mousedown', (event) => {
-            if (event.target.tagName === 'INPUT' || event.target.closest('button')) return;
-
-            const startX = event.clientX;
-            const startY = event.clientY;
-            const rect = panel.getBoundingClientRect();
-            const startLeft = rect.left;
-            const startTop = rect.top;
-
-            function onMove(moveEvent) {
-                panel.style.left = `${startLeft + (moveEvent.clientX - startX)}px`;
-                panel.style.top = `${startTop + (moveEvent.clientY - startY)}px`;
-                panel.style.right = 'auto';
-            }
-
-            function onUp() {
-                document.removeEventListener('mousemove', onMove);
-                document.removeEventListener('mouseup', onUp);
-            }
-
-            document.addEventListener('mousemove', onMove);
-            document.addEventListener('mouseup', onUp);
-        });
-
-        setTimeout(() => panel.classList.add('toc-visible'), 100);
-        if (!STATE.resizeBound) {
-            window.addEventListener('resize', () => {
-                schedulePositionRefresh();
-            }, { passive: true });
-            STATE.resizeBound = true;
-        }
-        startObserver();
-        scanContent();
+        return searchDiv;
     }
 
-    function scanContent() {
-        const list = document.getElementById('toc-list');
-        if (!list) return;
-        const previousActiveIndex = STATE.activeIndex;
+    function createHeaderSection() {
+        const header = document.createElement('div');
+        header.className = 'toc-header';
+        header.append(createHeaderRow(), createSearchSection());
+        return header;
+    }
 
-        const allLines = Array.from(document.querySelectorAll(CONFIG.selector));
-        const messages = [];
-        let currentGroup = null;
+    function createTocListElement() {
+        const list = document.createElement('ul');
+        list.id = 'toc-list';
+        bindTocListInteractions(list);
+        return list;
+    }
 
-        allLines.forEach((line) => {
-            const container = resolveMessageContainer(line);
-            if (!container) return;
-            const text = extractMessageLabel(line, container);
-            if (!text) return;
+    function clearElementChildren(element) {
+        while (element.firstChild) element.removeChild(element.firstChild);
+    }
 
-            if (currentGroup && currentGroup.container === container) {
-                if (currentGroup.text !== text) {
-                    currentGroup.text += ` ${text}`;
-                }
-            } else {
-                if (currentGroup) messages.push(currentGroup);
-                currentGroup = { container, anchor: line, text };
-            }
-        });
+    function renderEmptyTocState(list) {
+        setActiveIndex(-1);
+        if (list.querySelector('.toc-status')) return;
 
-        if (currentGroup) messages.push(currentGroup);
-        const usedContainers = new Set(messages.map((message) => message.container));
-        const knownSignatures = new Set(messages.map((message) => getContainerSignature(message.container)).filter(Boolean));
-        const imageOnlyMessages = collectImageOnlyMessages(knownSignatures, usedContainers);
-        if (imageOnlyMessages.length) {
-            messages.push(...imageOnlyMessages);
-            messages.sort(compareMessageOrder);
-        }
-        STATE.messages = messages;
+        clearElementChildren(list);
+        const item = document.createElement('li');
+        item.className = 'toc-status';
+        item.textContent = '...';
+        list.appendChild(item);
+    }
 
-        const total = messages.length;
-        if (total === 0) {
-            setActiveIndex(-1);
-            if (!list.querySelector('.toc-status')) {
-                while (list.firstChild) list.removeChild(list.firstChild);
-                const item = document.createElement('li');
-                item.className = 'toc-status';
-                item.textContent = '...';
-                list.appendChild(item);
-            }
-            return;
-        }
+    function ensureTocItem(list, index) {
+        let item = list.children[index];
+        if (item) return item;
 
-        if (list.querySelector('.toc-status')) {
-            while (list.firstChild) list.removeChild(list.firstChild);
-        }
+        item = document.createElement('li');
+        item.className = 'toc-item';
 
-        for (let i = 0; i < total; i++) {
-            const msg = messages[i];
-            const text = msg.text;
+        const icon = document.createElement('span');
+        icon.className = 'toc-icon';
+        icon.appendChild(createIcon('bullet'));
 
-            let item = list.children[i];
-            if (!item) {
-                item = document.createElement('li');
-                item.className = 'toc-item';
+        const label = document.createElement('span');
+        label.className = 'toc-text';
 
-                const icon = document.createElement('span');
-                icon.className = 'toc-icon';
-                icon.appendChild(createIcon('bullet'));
+        item.append(icon, label);
+        list.appendChild(item);
+        return item;
+    }
 
-                const label = document.createElement('span');
-                label.className = 'toc-text';
-
-                item.append(icon, label);
-                list.appendChild(item);
-            }
-
-            const normalizedText = text.toLowerCase();
-            if (item.getAttribute('data-text') !== normalizedText) {
-                item.setAttribute('data-text', normalizedText);
-                item.title = text;
-                item.querySelector('.toc-text').textContent = text;
-            }
-
-            item.dataset.index = String(i);
+    function updateTocItem(item, text, index) {
+        const normalizedText = text.toLowerCase();
+        if (item.getAttribute('data-text') !== normalizedText) {
+            item.setAttribute('data-text', normalizedText);
+            item.title = text;
+            item.querySelector('.toc-text').textContent = text;
         }
 
+        item.dataset.index = String(index);
+    }
+
+    function trimExtraTocItems(list, total) {
         while (list.children.length > total) {
             list.removeChild(list.lastChild);
         }
+    }
 
+    function renderTocItems(list, messages) {
+        for (let i = 0; i < messages.length; i++) {
+            const item = ensureTocItem(list, i);
+            updateTocItem(item, messages[i].text, i);
+        }
+
+        trimExtraTocItems(list, messages.length);
+    }
+
+    function resetTocActiveState(list, previousActiveIndex, total) {
         if (previousActiveIndex >= 0 && list.children[previousActiveIndex]) {
             list.children[previousActiveIndex].classList.remove('toc-active');
         }
+
         STATE.activeIndex = -1;
+        if (STATE.clickLockIndex >= total) {
+            STATE.clickLockIndex = -1;
+        }
+        clearManualActiveIndex();
+    }
 
+    function syncTocSearchFilter() {
         const input = document.querySelector('.toc-search input');
-        if (input && input.value) filterList(input.value);
+        if (input && input.value) {
+            filterList(input.value);
+        }
+    }
 
+    function finalizeRenderedToc(list, previousActiveIndex, total) {
+        resetTocActiveState(list, previousActiveIndex, total);
+        syncTocSearchFilter();
         bindScrollSync();
         refreshPositionCache();
         scheduleActiveSync();
     }
 
-    if (document.getElementById('ai-toc-v2_2')) {
-        startObserver();
-        scheduleScan(0);
-    } else {
-        createUI();
+    function collectCurrentMessages() {
+        const messages = collectMessagesFromAdapter(ADAPTER);
+        STATE.messages = messages;
+        return messages;
     }
-    setInterval(() => {
-        const panel = document.getElementById('ai-toc-v2_2');
+
+    function clearTocStatusState(list) {
+        if (list.querySelector('.toc-status')) {
+            clearElementChildren(list);
+        }
+    }
+
+    function renderScanResult(list, messages, previousActiveIndex) {
+        const total = messages.length;
+        if (total === 0) {
+            renderEmptyTocState(list);
+            return;
+        }
+
+        clearTocStatusState(list);
+        renderTocItems(list, messages);
+        finalizeRenderedToc(list, previousActiveIndex, total);
+    }
+
+    // App bootstrap
+    function createUI() {
+        if (getPanelElement()) return;
+        if (!document.body) return;
+
+        injectStyles();
+
+        const panel = createPanelElement();
+        const header = createHeaderSection();
+        const list = createTocListElement();
+
+        panel.append(header, list);
+        document.body.appendChild(panel);
+
+        bindGlobalInteractionEvents();
+        bindPanelDrag(panel, header);
+
+        setTimeout(() => panel.classList.add('toc-visible'), 100);
+        bindWindowResizeRefresh();
+        startObserver();
+        scanContent();
+    }
+
+    function scanContent() {
+        const list = getTocList();
+        if (!list) return;
+        renderScanResult(list, collectCurrentMessages(), STATE.activeIndex);
+    }
+
+    function ensureAppRunning() {
+        const panel = getPanelElement();
         if (!panel) {
             createUI();
         }
         if (!STATE.observer) {
             startObserver();
         }
-    }, 2000);
+    }
+
+    function bootstrap() {
+        ensureAppRunning();
+        if (getPanelElement()) {
+            scheduleScan(0);
+        }
+        window.setInterval(ensureAppRunning, 2000);
+    }
+
+    bootstrap();
 })();
