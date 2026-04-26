@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 目录插件 (Gemini & ChatGPT)
 // @namespace    http://tampermonkey.net/
-// @version      2.5.0
+// @version      2.6.0
 // @description  生成高效的 Gemini 与 ChatGPT 对话目录索引窗口。
 // @author       ArcherEmiya
 // @match        https://gemini.google.com/*
@@ -36,10 +36,15 @@
     }
 
     cleanUpOldVersions();
-    console.log('AI TOC Plugin v2.5.0: started');
+    console.log('AI TOC Plugin v2.6.0: started');
 
     const CONFIG = {
-        displayCount: 8
+        displayCount: 8,
+        panelWidth: 280,
+        panelMargin: 8,
+        bubbleSize: 48,
+        autoCollapse: true,
+        autoCollapseDelay: 12000
     };
     const TIMINGS = {
         scanDelay: 120,
@@ -69,10 +74,18 @@
         resizeBound: false,
         scanTimer: 0,
         positionTimer: 0,
+        autoCollapseTimer: 0,
         positionCache: [],
         positionsDirty: true,
         observer: null,
         globalEventsBound: false
+    };
+
+    const STORAGE_KEYS = {
+        panelPosition: 'ai-toc-v2_5-panel-position',
+        expandedPosition: 'ai-toc-v2_5-expanded-position',
+        bubblePosition: 'ai-toc-v2_5-bubble-position',
+        collapsed: 'ai-toc-v2_5-collapsed'
     };
 
     const PATHS = {
@@ -80,7 +93,10 @@
         top: 'M7 4h10v2H7V4zm5 3l-5 5h3v8h4v-8h3l-5-5z',
         bottom: 'M10 4h4v8h3l-5 5-5-5h3V4zM7 18h10v2H7v-2z',
         spin: 'M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z',
-        bullet: 'M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10z'
+        bullet: 'M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10z',
+        collapse: 'M19 13H5v-2h14v2z',
+        expand: 'M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z',
+        clear: 'M18.3 5.71 16.89 4.3 12 9.17 7.11 4.3 5.7 5.71 10.59 10.6 5.7 15.49 7.11 16.9 12 12.01 16.89 16.9 18.3 15.49 13.41 10.6z'
     };
 
     // Site adapters and message collection
@@ -301,7 +317,7 @@
                 position: fixed;
                 top: 80px;
                 right: 24px;
-                width: 280px;
+                width: ${CONFIG.panelWidth}px;
                 background: #1e1f20;
                 color: #e3e3e3;
                 border-radius: 24px;
@@ -315,14 +331,68 @@
                 max-height: 85vh;
                 border: 1px solid #444746;
                 opacity: 0;
-                transition: opacity 0.3s;
+                transition:
+                    opacity 0.3s,
+                    left 0.22s ease,
+                    top 0.22s ease,
+                    width 0.22s ease,
+                    height 0.22s ease,
+                    max-height 0.22s ease,
+                    border-radius 0.22s ease,
+                    transform 0.26s ease;
                 contain: content;
             }
             #ai-toc-v2_2.toc-visible { opacity: 1; }
             #ai-toc-v2_2.notranslate { translate: no; }
+            #ai-toc-v2_2.toc-dragging {
+                transition: none !important;
+                cursor: grabbing;
+            }
+            #ai-toc-v2_2.toc-slide-opening {
+                transition: transform 0.26s ease, opacity 0.18s ease;
+                transform: translateX(var(--toc-slide-x, 0));
+            }
+            #ai-toc-v2_2.toc-slide-opening.toc-slide-open {
+                transform: translateX(0);
+            }
+            #ai-toc-v2_2.toc-collapsed {
+                width: 48px;
+                height: 48px;
+                max-height: 48px;
+                border-radius: 999px;
+                cursor: grab;
+            }
+            #ai-toc-v2_2.toc-collapsed .toc-header {
+                padding: 0;
+                height: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            #ai-toc-v2_2.toc-collapsed .toc-title,
+            #ai-toc-v2_2.toc-collapsed .toc-actions .toc-btn:not(.toc-collapse-btn),
+            #ai-toc-v2_2.toc-collapsed .toc-search,
+            #ai-toc-v2_2.toc-collapsed #toc-list {
+                display: none;
+            }
+            #ai-toc-v2_2.toc-collapsed .toc-row {
+                align-items: center;
+                justify-content: center;
+                margin-bottom: 0;
+                width: 100%;
+                height: 100%;
+            }
             .toc-header { padding: 16px 16px 8px 16px; background: #1e1f20; flex-shrink: 0; }
             .toc-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
             .toc-title { font-weight: 500; font-size: 14px; color: #e3e3e3; padding-left: 4px; }
+            .toc-actions { display: flex; gap: 4px; }
+            #ai-toc-v2_2.toc-collapsed .toc-actions {
+                width: 100%;
+                height: 100%;
+                align-items: center;
+                justify-content: center;
+                gap: 0;
+            }
             .toc-btn {
                 background: transparent;
                 border: none;
@@ -335,6 +405,14 @@
                 align-items: center;
                 justify-content: center;
                 transition: background 0.2s;
+            }
+            .toc-btn svg { display: block; }
+            .toc-bubble-label {
+                display: block;
+                font-size: 12px;
+                font-weight: 600;
+                line-height: 1;
+                letter-spacing: 0;
             }
             .toc-btn:hover { background: rgba(255,255,255,0.1); color: #e3e3e3; }
             .toc-spin { animation: spin 1s linear infinite; }
@@ -362,6 +440,19 @@
                 transform: translateY(-50%);
                 color: #c4c7c5;
                 display: flex;
+            }
+            .toc-clear-btn {
+                position: absolute;
+                right: 6px;
+                top: 50%;
+                transform: translateY(-50%);
+                display: none;
+            }
+            .toc-search.has-value .toc-clear-btn {
+                display: flex;
+            }
+            .toc-search.has-value input {
+                padding-right: 40px;
             }
             #toc-list {
                 list-style: none;
@@ -595,6 +686,264 @@
         return Math.min(index, getLastMessageIndex());
     }
 
+    function clampNumber(value, min, max) {
+        return Math.min(Math.max(value, min), max);
+    }
+
+    function readStorageValue(key) {
+        try {
+            return window.localStorage.getItem(key);
+        } catch (error) {
+            return null;
+        }
+    }
+
+    function writeStorageValue(key, value) {
+        try {
+            window.localStorage.setItem(key, value);
+        } catch (error) {
+            // Storage can be blocked in privacy modes; the panel should still work.
+        }
+    }
+
+    function readStoredPosition(key) {
+        const raw = readStorageValue(key);
+        if (!raw) return null;
+
+        try {
+            const parsed = JSON.parse(raw);
+            if (typeof parsed.left !== 'number' || typeof parsed.top !== 'number') return null;
+            return parsed;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    function readStoredExpandedPosition() {
+        return readStoredPosition(STORAGE_KEYS.expandedPosition) || readStoredPosition(STORAGE_KEYS.panelPosition);
+    }
+
+    function readStoredBubblePosition() {
+        const raw = readStorageValue(STORAGE_KEYS.bubblePosition);
+        if (!raw) return null;
+
+        try {
+            const parsed = JSON.parse(raw);
+            if (parsed.side !== 'left' && parsed.side !== 'right') return null;
+            if (typeof parsed.top !== 'number') return null;
+            return parsed;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    function getConstrainedPanelPosition(panel, left, top, size) {
+        const rect = panel.getBoundingClientRect();
+        const margin = CONFIG.panelMargin;
+        const width = size && typeof size.width === 'number' ? size.width : (rect.width || panel.offsetWidth || CONFIG.bubbleSize);
+        const height = size && typeof size.height === 'number' ? size.height : (rect.height || panel.offsetHeight || CONFIG.bubbleSize);
+        const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+        const maxTop = Math.max(margin, window.innerHeight - height - margin);
+
+        return {
+            left: clampNumber(left, margin, maxLeft),
+            top: clampNumber(top, margin, maxTop)
+        };
+    }
+
+    function getPositionSide(position) {
+        if (!position) return null;
+        return position.left + CONFIG.panelWidth / 2 < window.innerWidth / 2 ? 'left' : 'right';
+    }
+
+    function getExpandedPositionFromBubble(panel, side) {
+        const rect = panel.getBoundingClientRect();
+        const left = side === 'left'
+            ? CONFIG.panelMargin
+            : window.innerWidth - CONFIG.panelWidth - CONFIG.panelMargin;
+        return getConstrainedPanelPosition(panel, left, rect.top, { width: CONFIG.panelWidth, height: rect.height || CONFIG.bubbleSize });
+    }
+
+    function resolveExpandedPositionForBubble(panel, side, storedPosition) {
+        if (storedPosition && getPositionSide(storedPosition) === side) {
+            return storedPosition;
+        }
+        return getExpandedPositionFromBubble(panel, side);
+    }
+
+    function applyPanelPosition(panel, position) {
+        const next = getConstrainedPanelPosition(panel, position.left, position.top);
+        panel.style.left = `${next.left}px`;
+        panel.style.top = `${next.top}px`;
+        panel.style.right = 'auto';
+        return next;
+    }
+
+    function getNearestBubbleSide(panel) {
+        const rect = panel.getBoundingClientRect();
+        return rect.left + rect.width / 2 < window.innerWidth / 2 ? 'left' : 'right';
+    }
+
+    function getConstrainedBubblePosition(panel, position) {
+        const margin = CONFIG.panelMargin;
+        const height = CONFIG.bubbleSize;
+        return {
+            side: position.side === 'left' ? 'left' : 'right',
+            top: clampNumber(position.top, margin, Math.max(margin, window.innerHeight - height - margin))
+        };
+    }
+
+    function applyBubblePosition(panel, position) {
+        const next = getConstrainedBubblePosition(panel, position);
+        const width = CONFIG.bubbleSize;
+        panel.dataset.side = next.side;
+        panel.style.left = next.side === 'left'
+            ? `${CONFIG.panelMargin}px`
+            : `${Math.max(CONFIG.panelMargin, window.innerWidth - width - CONFIG.panelMargin)}px`;
+        panel.style.top = `${next.top}px`;
+        panel.style.right = 'auto';
+        return next;
+    }
+
+    function getBubblePositionFromCurrentPanel(panel) {
+        const rect = panel.getBoundingClientRect();
+        return {
+            side: getNearestBubbleSide(panel),
+            top: rect.top
+        };
+    }
+
+    function saveExpandedPanelPosition(panel) {
+        if (!panel) return;
+        const rect = panel.getBoundingClientRect();
+        const position = applyPanelPosition(panel, { left: rect.left, top: rect.top });
+        writeStorageValue(STORAGE_KEYS.expandedPosition, JSON.stringify(position));
+    }
+
+    function saveBubblePosition(panel) {
+        if (!panel) return;
+        const position = applyBubblePosition(panel, {
+            side: panel.dataset.side || getNearestBubbleSide(panel),
+            top: panel.getBoundingClientRect().top
+        });
+        writeStorageValue(STORAGE_KEYS.bubblePosition, JSON.stringify(position));
+    }
+
+    function saveCurrentPanelPosition(panel) {
+        if (!panel) return;
+        if (panel.classList.contains('toc-collapsed')) {
+            saveBubblePosition(panel);
+        } else {
+            saveExpandedPanelPosition(panel);
+        }
+    }
+
+    function constrainPanelToViewport(panel, persist) {
+        if (!panel) return;
+        if (panel.classList.contains('toc-collapsed')) {
+            applyBubblePosition(panel, {
+                side: panel.dataset.side || getNearestBubbleSide(panel),
+                top: panel.getBoundingClientRect().top
+            });
+            if (persist) saveBubblePosition(panel);
+            return;
+        }
+
+        const rect = panel.getBoundingClientRect();
+        applyPanelPosition(panel, { left: rect.left, top: rect.top });
+        if (persist) saveExpandedPanelPosition(panel);
+    }
+
+    function beginSlideExpand(panel, side) {
+        panel.style.setProperty('--toc-slide-x', side === 'left' ? 'calc(-100% - 16px)' : 'calc(100% + 16px)');
+        panel.classList.add('toc-slide-opening');
+        panel.classList.remove('toc-slide-open');
+    }
+
+    function finishSlideExpand(panel) {
+        window.requestAnimationFrame(() => {
+            panel.classList.add('toc-slide-open');
+        });
+
+        window.setTimeout(() => {
+            panel.classList.remove('toc-slide-opening', 'toc-slide-open');
+            panel.style.removeProperty('--toc-slide-x');
+        }, 300);
+    }
+
+    function setPanelCollapsed(panel, collapsed, persist) {
+        if (!panel) return;
+        const wasCollapsed = panel.classList.contains('toc-collapsed');
+        const bubblePosition = persist === false
+            ? (readStoredBubblePosition() || getBubblePositionFromCurrentPanel(panel))
+            : getBubblePositionFromCurrentPanel(panel);
+        const openingFromBubble = wasCollapsed && !collapsed;
+        const openingSide = openingFromBubble ? (panel.dataset.side || getNearestBubbleSide(panel)) : null;
+        const storedExpandedPosition = collapsed ? null : readStoredExpandedPosition();
+        const expandedPosition = openingFromBubble
+            ? resolveExpandedPositionForBubble(panel, openingSide, storedExpandedPosition)
+            : storedExpandedPosition;
+
+        if (collapsed && !wasCollapsed) {
+            saveExpandedPanelPosition(panel);
+        }
+
+        if (openingFromBubble) {
+            beginSlideExpand(panel, openingSide);
+        }
+
+        panel.classList.toggle('toc-collapsed', collapsed);
+
+        const button = panel.querySelector('.toc-collapse-btn');
+        if (button) {
+            button.title = collapsed ? '\u5c55\u5f00\u9762\u677f' : '\u6298\u53e0\u9762\u677f';
+            button.setAttribute('aria-label', button.title);
+            button.setAttribute('aria-expanded', String(!collapsed));
+            if (collapsed) {
+                setButtonText(button, getBubbleLabel(), 'toc-bubble-label');
+            } else {
+                setButtonIcon(button, 'collapse');
+            }
+        }
+
+        if (persist !== false) {
+            writeStorageValue(STORAGE_KEYS.collapsed, collapsed ? '1' : '0');
+        }
+
+        if (collapsed) {
+            const snapBubble = () => {
+                const next = applyBubblePosition(panel, bubblePosition);
+                if (persist !== false) writeStorageValue(STORAGE_KEYS.bubblePosition, JSON.stringify(next));
+                clearAutoCollapseTimer();
+            };
+            window.requestAnimationFrame(snapBubble);
+            window.setTimeout(snapBubble, 240);
+            return;
+        }
+
+        if (expandedPosition) {
+            applyPanelPosition(panel, expandedPosition);
+        } else {
+            constrainPanelToViewport(panel, false);
+        }
+        if (openingFromBubble) {
+            finishSlideExpand(panel);
+        }
+        scheduleAutoCollapse();
+    }
+
+    function togglePanelCollapsed() {
+        const panel = getPanelElement();
+        if (!panel) return;
+        setPanelCollapsed(panel, !panel.classList.contains('toc-collapsed'));
+    }
+
+    function restorePanelState(panel) {
+        const collapsed = readStorageValue(STORAGE_KEYS.collapsed) === '1';
+        setPanelCollapsed(panel, collapsed, false);
+        if (!collapsed) scheduleAutoCollapse();
+    }
+
     // DOM observation and message ordering
     function getMutationElement(node) {
         if (!node) return null;
@@ -785,6 +1134,7 @@
         STATE.forcedActiveIndex = -1;
         clearManualActiveIndex();
         scanContent();
+        scheduleAutoCollapse();
     }
 
     function getActiveThreshold(container) {
@@ -866,6 +1216,18 @@
     function setButtonIcon(btn, iconKey, className) {
         while (btn.firstChild) btn.removeChild(btn.firstChild);
         btn.appendChild(createIcon(iconKey, className));
+    }
+
+    function getBubbleLabel() {
+        return ADAPTER.id === 'chatgpt' ? 'GPT' : 'Gem';
+    }
+
+    function setButtonText(btn, text, className) {
+        while (btn.firstChild) btn.removeChild(btn.firstChild);
+        const label = document.createElement('span');
+        label.className = className || '';
+        label.textContent = text;
+        btn.appendChild(label);
     }
 
     function markTocUserScroll(duration) {
@@ -989,6 +1351,64 @@
         });
     }
 
+    function clearAutoCollapseTimer() {
+        if (!STATE.autoCollapseTimer) return;
+        window.clearTimeout(STATE.autoCollapseTimer);
+        STATE.autoCollapseTimer = 0;
+    }
+
+    function hasSearchInputValue(panel) {
+        const input = panel ? panel.querySelector('.toc-search input') : null;
+        return !!(input && input.value.trim());
+    }
+
+    function shouldKeepPanelExpanded(panel) {
+        if (!panel || panel.classList.contains('toc-collapsed')) return true;
+        if (hasSearchInputValue(panel)) return true;
+        if (panel.contains(document.activeElement)) return true;
+        if (panel.matches(':hover')) return true;
+        if (panel.querySelector('.toc-btn:disabled')) return true;
+        return false;
+    }
+
+    function scheduleAutoCollapse() {
+        clearAutoCollapseTimer();
+        if (!CONFIG.autoCollapse) return;
+
+        const panel = getPanelElement();
+        if (shouldKeepPanelExpanded(panel)) return;
+
+        STATE.autoCollapseTimer = window.setTimeout(() => {
+            STATE.autoCollapseTimer = 0;
+            const currentPanel = getPanelElement();
+            if (!currentPanel || shouldKeepPanelExpanded(currentPanel)) {
+                scheduleAutoCollapse();
+                return;
+            }
+            setPanelCollapsed(currentPanel, true);
+        }, CONFIG.autoCollapseDelay);
+    }
+
+    function notePanelActivity() {
+        const panel = getPanelElement();
+        if (!panel || panel.classList.contains('toc-collapsed')) return;
+        clearAutoCollapseTimer();
+        window.setTimeout(scheduleAutoCollapse, 0);
+    }
+
+    function bindPanelActivity(panel) {
+        panel.addEventListener('pointerenter', clearAutoCollapseTimer);
+        panel.addEventListener('pointerleave', scheduleAutoCollapse);
+        panel.addEventListener('focusin', clearAutoCollapseTimer);
+        panel.addEventListener('focusout', () => window.setTimeout(scheduleAutoCollapse, 0));
+        panel.addEventListener('click', notePanelActivity);
+        panel.addEventListener('input', notePanelActivity);
+        panel.addEventListener('keydown', notePanelActivity);
+        panel.addEventListener('wheel', notePanelActivity, { passive: true });
+        panel.addEventListener('touchmove', notePanelActivity, { passive: true });
+        panel.addEventListener('scroll', notePanelActivity, { passive: true });
+    }
+
     // TOC interactions and global input handling
     function bindScrollSync() {
         const nextContainer = getScrollContainer();
@@ -1004,32 +1424,76 @@
     }
 
     function filterList(value) {
-        const items = document.querySelectorAll('.toc-item');
-        const keyword = value.toLowerCase();
+        const list = getTocList();
+        const items = Array.from(document.querySelectorAll('.toc-item'));
+        const keyword = value.trim().toLowerCase();
+        let visibleCount = 0;
+
         items.forEach((item) => {
             const text = item.getAttribute('data-text') || '';
-            item.classList.toggle('toc-hidden', !text.includes(keyword));
+            const hidden = !!keyword && !text.includes(keyword);
+            item.classList.toggle('toc-hidden', hidden);
+            if (!hidden) visibleCount++;
         });
+
+        setNoResultsState(list, !!keyword && items.length > 0 && visibleCount === 0);
+    }
+
+    function setNoResultsState(list, visible) {
+        if (!list) return;
+
+        let item = list.querySelector('.toc-no-results');
+        if (!visible) {
+            if (item) item.remove();
+            return;
+        }
+
+        if (!item) {
+            item = document.createElement('li');
+            item.className = 'toc-status toc-no-results';
+            item.textContent = '\u65e0\u5339\u914d\u7ed3\u679c';
+            list.appendChild(item);
+        }
+    }
+
+    function updateSearchState(input) {
+        const search = input.closest('.toc-search');
+        if (search) {
+            search.classList.toggle('has-value', !!input.value);
+        }
+        filterList(input.value);
     }
 
     function handleSearchInput(event) {
-        filterList(event.target.value);
+        updateSearchState(event.target);
+        notePanelActivity();
+    }
+
+    function clearSearchInput() {
+        const input = document.querySelector('.toc-search input');
+        if (!input) return;
+
+        input.value = '';
+        updateSearchState(input);
+        input.focus();
+        notePanelActivity();
     }
 
     function handleTocUserWheel() {
         markTocUserScroll(TIMINGS.tocUserScroll);
+        notePanelActivity();
     }
 
     function handleTocListScroll() {
         if (!STATE.tocSyncing) {
             markTocUserScroll(TIMINGS.tocUserScroll);
+            notePanelActivity();
         }
     }
 
     function triggerBottomBoundaryNavigation() {
         const panel = getPanelElement();
-        const buttons = panel ? panel.querySelectorAll('.toc-btn') : null;
-        const bottomButton = buttons && buttons.length > 1 ? buttons[1] : null;
+        const bottomButton = panel ? panel.querySelector('.toc-actions .toc-btn:last-child') : null;
         if (bottomButton) {
             handleBot.call(bottomButton);
         }
@@ -1044,6 +1508,7 @@
         if (!msg) return;
 
         if (isMessageConnected(msg)) {
+            notePanelActivity();
             STATE.clickLockIndex = index;
             setActiveIndex(index);
             holdManualActiveIndex(index);
@@ -1102,14 +1567,26 @@
         const rect = panel.getBoundingClientRect();
         const startLeft = rect.left;
         const startTop = rect.top;
+        panel.classList.add('toc-dragging');
 
         function onMove(moveEvent) {
-            panel.style.left = `${startLeft + (moveEvent.clientX - startX)}px`;
-            panel.style.top = `${startTop + (moveEvent.clientY - startY)}px`;
+            const next = getConstrainedPanelPosition(
+                panel,
+                startLeft + (moveEvent.clientX - startX),
+                startTop + (moveEvent.clientY - startY)
+            );
+            panel.style.left = `${next.left}px`;
+            panel.style.top = `${next.top}px`;
             panel.style.right = 'auto';
         }
 
         function onUp() {
+            panel.classList.remove('toc-dragging');
+            if (panel.classList.contains('toc-collapsed')) {
+                applyBubblePosition(panel, getBubblePositionFromCurrentPanel(panel));
+            }
+            saveCurrentPanelPosition(panel);
+            scheduleAutoCollapse();
             document.removeEventListener('mousemove', onMove);
             document.removeEventListener('mouseup', onUp);
         }
@@ -1126,6 +1603,7 @@
         if (STATE.resizeBound) return;
 
         window.addEventListener('resize', () => {
+            constrainPanelToViewport(getPanelElement(), true);
             schedulePositionRefresh();
         }, { passive: true });
         STATE.resizeBound = true;
@@ -1264,10 +1742,12 @@
         return panel;
     }
 
-    function createActionButton(title, iconKey, handler) {
+    function createActionButton(title, iconKey, handler, className) {
         const button = document.createElement('button');
-        button.className = 'toc-btn';
+        button.type = 'button';
+        button.className = className ? `toc-btn ${className}` : 'toc-btn';
         button.title = title;
+        button.setAttribute('aria-label', title);
         button.appendChild(createIcon(iconKey));
         button.onclick = handler;
         return button;
@@ -1282,9 +1762,9 @@
         title.textContent = ADAPTER.title;
 
         const btnGroup = document.createElement('div');
-        btnGroup.style.display = 'flex';
-        btnGroup.style.gap = '4px';
+        btnGroup.className = 'toc-actions';
         btnGroup.append(
+            createActionButton('\u6298\u53e0\u9762\u677f', 'collapse', togglePanelCollapsed, 'toc-collapse-btn'),
             createActionButton('回到顶部', 'top', handleTop),
             createActionButton('直达底部', 'bottom', handleBot)
         );
@@ -1306,7 +1786,9 @@
         input.placeholder = '搜索...';
         input.addEventListener('input', handleSearchInput);
 
-        searchDiv.append(searchIcon, input);
+        const clearButton = createActionButton('\u6e05\u7a7a\u641c\u7d22', 'clear', clearSearchInput, 'toc-clear-btn');
+
+        searchDiv.append(searchIcon, input, clearButton);
         return searchDiv;
     }
 
@@ -1330,8 +1812,6 @@
 
     function renderEmptyTocState(list) {
         setActiveIndex(-1);
-        if (list.querySelector('.toc-status')) return;
-
         clearElementChildren(list);
         const item = document.createElement('li');
         item.className = 'toc-status';
@@ -1399,7 +1879,7 @@
     function syncTocSearchFilter() {
         const input = document.querySelector('.toc-search input');
         if (input && input.value) {
-            filterList(input.value);
+            updateSearchState(input);
         }
     }
 
@@ -1448,9 +1928,11 @@
 
         panel.append(header, list);
         document.body.appendChild(panel);
+        restorePanelState(panel);
 
         bindGlobalInteractionEvents();
         bindPanelDrag(panel, header);
+        bindPanelActivity(panel);
 
         setTimeout(() => panel.classList.add('toc-visible'), 100);
         bindWindowResizeRefresh();
