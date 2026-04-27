@@ -3,10 +3,10 @@
 面向 ChatGPT 与 Gemini 网页版的 Tampermonkey 用户脚本，用于生成侧边目录，提升长对话场景下的浏览、定位与回看效率。
 
 ## 面板: 
-![demo](https://raw.githubusercontent.com/W-ArcherEmiya/Images/blob/main/ai_web_enhancer/scrennshoot_board.png)
+![demo](https://raw.githubusercontent.com/W-ArcherEmiya/Images/main/ai_web_enhancer/scrennshoot_board.png)
 
 ## 侧边气泡:
-![demo](https://raw.githubusercontent.com/W-ArcherEmiya/Images/blob/main/ai_web_enhancer/scrennshoot_bubble.png)
+![demo](https://raw.githubusercontent.com/W-ArcherEmiya/Images/main/ai_web_enhancer/scrennshoot_bubble.png)
 
 
 ## 功能
