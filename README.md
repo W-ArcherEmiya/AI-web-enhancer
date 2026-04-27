@@ -6,7 +6,7 @@
 ![demo](https://raw.githubusercontent.com/W-ArcherEmiya/Images/blob/main/ai_web_enhancer/scrennshoot_board.png)
 
 ## 侧边气泡:
-![demo](https://raw.githubusercontent.com/W-ArcherEmiya/Images/blob/main/ai_web_enhancer/scrennshoot_bubble.pngg)
+![demo](https://raw.githubusercontent.com/W-ArcherEmiya/Images/blob/main/ai_web_enhancer/scrennshoot_bubble.png)
 
 
 ## 功能
