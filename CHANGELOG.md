@@ -2,6 +2,23 @@
 
 本文档记录 AI Web Enhancer 的重要更新。
 
+## [v2.8.0] - 2026-06-08
+
+### 新增
+
+- 新增 Claude Web 基础支持，支持在 Claude 对话页面生成用户提问目录。
+- 新增 Claude 站点适配器，识别 `[data-testid="user-message"]` 与 `.font-user-message` 等常见用户消息节点。
+- 新增 Claude 气泡标签 `Cl`。
+
+### 变更
+
+- 脚本匹配范围新增 `https://claude.ai/*`。
+- 脚本名称与说明更新为支持 Gemini、ChatGPT 与 Claude。
+
+### 说明
+
+- Claude 首版支持基于当前页面已挂载 DOM 生成目录，暂不包含类似 ChatGPT 的远程会话补全逻辑。
+
 ## [v2.7.0] - 2026-06-08
 
 ### 修复

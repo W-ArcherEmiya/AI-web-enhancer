@@ -1,11 +1,12 @@
 // ==UserScript==
-// @name         AI 目录插件 (Gemini & ChatGPT)
+// @name         AI 目录插件 (Gemini & ChatGPT & Claude)
 // @namespace    http://tampermonkey.net/
-// @version      2.7.0
-// @description  生成高效的 Gemini 与 ChatGPT 对话目录索引窗口。
+// @version      2.8.0
+// @description  生成高效的 Gemini、ChatGPT 与 Claude 对话目录索引窗口。
 // @author       ArcherEmiya
 // @match        https://gemini.google.com/*
 // @match        https://chatgpt.com/*
+// @match        https://claude.ai/*
 // @grant        unsafeWindow
 // @run-at       document-start
 // @license      MIT
@@ -36,7 +37,7 @@
     }
 
     cleanUpOldVersions();
-    console.log('AI TOC Plugin v2.7.0: started');
+    console.log('AI TOC Plugin v2.8.0: started');
 
     function getPageWindow() {
         try {
@@ -881,11 +882,18 @@
                 hasElement: !!(entry.element && entry.element.isConnected),
                 isActive: entry.isActive
             }));
+            const adapterSamples = Array.from(document.querySelectorAll(ADAPTER.selector)).map((element, index) => ({
+                index,
+                text: normalizeMessageText(element).slice(0, 120)
+            }));
 
             return {
-                version: '2.7.0',
+                version: '2.8.0',
                 conversationId: getChatGptConversationId(),
                 url: window.location.href,
+                adapterId: ADAPTER.id,
+                adapterSelector: ADAPTER.selector,
+                adapterMatches: adapterSamples.length,
                 liveDomUserMessages: document.querySelectorAll('[data-message-author-role="user"]').length,
                 nativeTocMessages: getChatGptNativeTocEntries().length,
                 tocMessages: STATE.messages.length,
@@ -907,6 +915,7 @@
                 })),
                 slotSummary: getChatGptMessageSlotSummary(),
                 alignmentPreview: getTextAlignmentPreview(),
+                adapterSamples,
                 liveSamples,
                 remoteSamples,
                 nativeTocSamples,
@@ -915,9 +924,9 @@
             };
         };
         window.__aiTocDebug = debugFn;
-        window.__aiTocVersion = '2.7.0';
+        window.__aiTocVersion = '2.8.0';
         pageWindow.__aiTocDebug = debugFn;
-        pageWindow.__aiTocVersion = '2.7.0';
+        pageWindow.__aiTocVersion = '2.8.0';
     }
 
     function collectMessagesFromAdapter(adapter) {
@@ -992,10 +1001,40 @@
         return fallback ? [fallback] : [];
     }
 
+    const CLAUDE_USER_SELECTOR = [
+        '[data-testid="user-message"]',
+        '[data-testid^="user-message"]',
+        '.font-user-message',
+        '[class*="font-user-message"]'
+    ].join(', ');
+
+    function getClaudeMessageTextElement(container) {
+        if (!container || !container.querySelector) return container;
+        return container.querySelector('.font-user-message, [class*="font-user-message"]') || container;
+    }
+
+    function isClaudeComposerElement(element) {
+        if (!element || !element.closest) return false;
+        return !!element.closest('textarea, [contenteditable="true"], form, [data-testid*="composer"], [data-testid*="input"]');
+    }
+
+    function resolveClaudeMessageContainer(line) {
+        if (!line) return null;
+
+        const direct = line.closest('[data-testid="user-message"], [data-testid^="user-message"]');
+        if (direct) return direct;
+
+        const fontMessage = line.closest('.font-user-message, [class*="font-user-message"]');
+        if (fontMessage) return fontMessage;
+
+        return resolveGroupedMessageContainer(line, CLAUDE_USER_SELECTOR);
+    }
+
     const SITE_ADAPTERS = {
         chatgpt: {
             id: 'chatgpt',
             title: 'ChatGPT 索引',
+            label: 'GPT',
             selector: '[data-message-author-role="user"]',
             matches() {
                 return window.location.hostname.includes('chatgpt.com');
@@ -1046,6 +1085,7 @@
         gemini: {
             id: 'gemini',
             title: 'Gemini 索引',
+            label: 'Gem',
             selector: '.query-text-line',
             matches() {
                 return window.location.hostname.includes('gemini.google.com');
@@ -1090,6 +1130,31 @@
                 });
 
                 return results;
+            }
+        },
+        claude: {
+            id: 'claude',
+            title: 'Claude 索引',
+            label: 'Cl',
+            selector: CLAUDE_USER_SELECTOR,
+            matches() {
+                return window.location.hostname.includes('claude.ai');
+            },
+            resolveMessageContainer(line) {
+                return resolveClaudeMessageContainer(line);
+            },
+            getMessageLabel(line, container) {
+                if (isClaudeComposerElement(line) || isClaudeComposerElement(container)) return '';
+
+                const textElement = getClaudeMessageTextElement(container || line);
+                const text = normalizeMessageText(textElement);
+                return text || extractImageLabel(container || line);
+            },
+            getScrollReferenceTargets(messages) {
+                return getDefaultScrollReferenceTargets(messages, this.selector);
+            },
+            collectExtraMessages() {
+                return [];
             }
         }
     };
@@ -1272,11 +1337,20 @@
                 padding: 0;
                 margin: 0;
                 flex-grow: 1;
-                overflow-y: auto;
+                overflow-y: scroll;
                 max-height: ${maxH}px;
                 padding-bottom: 8px;
+                scrollbar-gutter: stable;
+                scrollbar-width: thin;
+                scrollbar-color: #444746 transparent;
             }
-            #toc-list::-webkit-scrollbar { width: 8px; }
+            #toc-list::-webkit-scrollbar {
+                width: 8px;
+                display: block;
+            }
+            #toc-list::-webkit-scrollbar-track {
+                background: transparent;
+            }
             #toc-list::-webkit-scrollbar-thumb {
                 background: #444746;
                 border-radius: 4px;
@@ -2975,7 +3049,7 @@
     }
 
     function getBubbleLabel() {
-        return ADAPTER.id === 'chatgpt' ? 'GPT' : 'Gem';
+        return ADAPTER.label || ADAPTER.id;
     }
 
     function setButtonText(btn, text, className) {
