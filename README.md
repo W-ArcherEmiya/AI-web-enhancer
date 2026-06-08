@@ -1,6 +1,6 @@
 # AI Web Enhancer
 
-面向 ChatGPT 与 Gemini 网页版的 Tampermonkey 用户脚本，用于生成侧边目录，提升长对话场景下的浏览、定位与回看效率。
+面向 ChatGPT、Gemini 与 Claude 网页版的 Tampermonkey 用户脚本，用于生成侧边目录，提升长对话场景下的浏览、定位与回看效率。
 
 ## 面板: 
 ![demo](https://raw.githubusercontent.com/W-ArcherEmiya/Images/main/ai_web_enhancer/scrennshoot_board.png)
@@ -21,6 +21,12 @@
 - 针对长对话与大 DOM 场景做了扫描与滚动性能优化
 
 ## 最新版本
+
+### v2.8.0
+
+- 新增 Claude Web 基础支持，可为 Claude 对话生成侧边目录并点击跳转。
+- Claude 页面使用 `Cl` 气泡标签，保持与 ChatGPT、Gemini 一致的目录交互。
+- 继续保留 ChatGPT 长对话完整目录和精确跳转能力。
 
 ### v2.7.0
 
@@ -44,6 +50,7 @@
 
 - ChatGPT Web
 - Gemini Web
+- Claude Web
 
 ## 技术栈
 
@@ -62,7 +69,7 @@
 
 ## 使用方式
 
-安装完成后，打开 ChatGPT 或 Gemini 页面即可自动生效。
+安装完成后，打开 ChatGPT、Gemini 或 Claude 页面即可自动生效。
 
 - 右侧会出现目录面板
 - 点击目录项可跳转到对应问题
