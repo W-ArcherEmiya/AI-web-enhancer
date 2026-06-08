@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         AI 目录插件 (Gemini & ChatGPT)
 // @namespace    http://tampermonkey.net/
-// @version      2.6.0
+// @version      2.7.0
 // @description  生成高效的 Gemini 与 ChatGPT 对话目录索引窗口。
 // @author       ArcherEmiya
 // @match        https://gemini.google.com/*
 // @match        https://chatgpt.com/*
-// @grant        none
-// @run-at       document-idle
+// @grant        unsafeWindow
+// @run-at       document-start
 // @license      MIT
 // ==/UserScript==
 
@@ -36,7 +36,16 @@
     }
 
     cleanUpOldVersions();
-    console.log('AI TOC Plugin v2.6.0: started');
+    console.log('AI TOC Plugin v2.7.0: started');
+
+    function getPageWindow() {
+        try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow) return unsafeWindow;
+        } catch (error) {
+            // Some script managers expose unsafeWindow lazily; window remains a valid fallback.
+        }
+        return window;
+    }
 
     const CONFIG = {
         displayCount: 8,
@@ -57,7 +66,9 @@
         bottomBoundaryStable: 600,
         boundaryInterval: 120,
         topBoundaryMaxAttempts: 240,
-        bottomBoundaryMaxAttempts: 120
+        bottomBoundaryMaxAttempts: 120,
+        virtualSeekInterval: 260,
+        virtualSeekMaxAttempts: 120
     };
     const STATE = {
         messages: [],
@@ -77,6 +88,16 @@
         autoCollapseTimer: 0,
         positionCache: [],
         positionsDirty: true,
+        remoteMessages: [],
+        remoteMessageContext: '',
+        remoteMessageSource: '',
+        remoteFetchContext: '',
+        remoteFetchInFlight: false,
+        remoteFetchStatus: '',
+        conversationInterceptorInstalled: false,
+        lastTocClick: null,
+        lastNavigationDebug: null,
+        virtualSeekTimer: 0,
         observer: null,
         globalEventsBound: false
     };
@@ -149,7 +170,759 @@
         return (node && node.textContent ? node.textContent : '').replace(/\s+/g, ' ').trim();
     }
 
+    function normalizePlainText(text) {
+        return (text || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function getComparableMessageText(text) {
+        return normalizePlainText(text)
+            .replace(/[\u200b-\u200f\ufeff]/g, '')
+            .replace(/^\[(image|photo|picture|file|attachment|图片|图像|文件|附件)\]\s*/i, '')
+            .replace(/\[(image|photo|picture|file|attachment|图片|图像|文件|附件)\]\s*/gi, '')
+            .replace(/^(you said|user said|您说|你说|我说)[:：]\s*/i, '')
+            .replace(/\s*(copy|copied|edit|复制|已复制|编辑)$/i, '')
+            .toLowerCase()
+            .replace(/\s+/g, '');
+    }
+
+    function isComparableTextMatch(remoteText, liveText) {
+        if (!remoteText || !liveText) return false;
+        if (remoteText === liveText) return true;
+
+        const minLength = Math.min(remoteText.length, liveText.length);
+        if (minLength < 4) return false;
+
+        return liveText.includes(remoteText) || remoteText.includes(liveText);
+    }
+
+    function normalizeNativeTocText(text) {
+        return normalizePlainText(text);
+    }
+
+    function isCompatibleNativeTocText(liveText, tocText) {
+        const live = normalizeNativeTocText(liveText);
+        const toc = normalizeNativeTocText(tocText);
+        if (!live || !toc) return false;
+        if (live === toc) return true;
+
+        const comparableLive = getComparableMessageText(live);
+        const comparableToc = getComparableMessageText(toc);
+        if (isComparableTextMatch(comparableLive, comparableToc)) return true;
+
+        return Math.min(live.length, toc.length) >= 200 && (live.startsWith(toc) || toc.startsWith(live));
+    }
+
+    function getChatGptNativeTocButtonIndex(button, fallbackIndex) {
+        const label = (button.getAttribute('aria-label') || '').trim();
+        const match = /^Prompt\s+(\d+)$/i.exec(label);
+        if (!match || !match[1]) return fallbackIndex;
+
+        const parsed = Number.parseInt(match[1], 10);
+        return Number.isNaN(parsed) ? fallbackIndex : Math.max(0, parsed - 1);
+    }
+
+    function getChatGptNativeTocButtons() {
+        if (!window.location.hostname.includes('chatgpt.com')) return [];
+
+        return Array.from(document.querySelectorAll('button[aria-label^="Prompt "]'))
+            .filter((button) => {
+                if (!(button instanceof HTMLElement)) return false;
+                const label = (button.getAttribute('aria-label') || '').trim();
+                if (!/^Prompt\s+\d+$/i.test(label)) return false;
+
+                const nativeTocContainer = button.closest('.no-scrollbar');
+                return !!(nativeTocContainer && nativeTocContainer.querySelectorAll('button[aria-label^="Prompt "]').length);
+            })
+            .sort((a, b) => getChatGptNativeTocButtonIndex(a, 0) - getChatGptNativeTocButtonIndex(b, 0));
+    }
+
+    function getChatGptNativeTocTexts(buttons) {
+        const firstButton = buttons[0];
+        const container = firstButton
+            ? firstButton.closest('.no-scrollbar')?.parentElement ||
+                firstButton.closest('.relative.flex.items-start') ||
+                firstButton.closest('.fixed')
+            : null;
+        if (!container) return [];
+
+        const titleElements = Array.from(container.querySelectorAll([
+            'button[data-fill] [title]',
+            'button[class*="__menu-item"] [title]',
+            'ul button [title]',
+            '[role="menu"] [title]',
+            '.absolute [title]'
+        ].join(', ')));
+        const seen = new Set();
+
+        return titleElements
+            .filter((element) => {
+                if (!(element instanceof HTMLElement)) return false;
+                if (seen.has(element)) return false;
+                seen.add(element);
+                return true;
+            })
+            .map((element) => normalizeNativeTocText(element.getAttribute('title') || element.textContent || ''))
+            .filter(Boolean);
+    }
+
+    function getChatGptNativeTocEntries() {
+        const buttons = getChatGptNativeTocButtons();
+        if (!buttons.length) return [];
+
+        const texts = getChatGptNativeTocTexts(buttons);
+        if (texts.length !== buttons.length) return [];
+
+        const textCounts = new Map();
+        texts.forEach((text) => {
+            const normalized = normalizeNativeTocText(text);
+            textCounts.set(normalized, (textCounts.get(normalized) || 0) + 1);
+        });
+
+        const liveByText = new Map();
+        Array.from(document.querySelectorAll('[data-message-author-role="user"]')).forEach((element) => {
+            const text = normalizeNativeTocText(normalizeMessageText(element));
+            if (!text) return;
+            const group = liveByText.get(text) || [];
+            group.push(element);
+            liveByText.set(text, group);
+        });
+
+        return buttons.map((button, index) => {
+            const text = texts[index] || '';
+            const normalizedText = normalizeNativeTocText(text);
+            const liveMatches = liveByText.get(normalizedText) || [];
+            const uniqueLiveElement = textCounts.get(normalizedText) === 1 && liveMatches.length === 1 ? liveMatches[0] : null;
+            return {
+                index: getChatGptNativeTocButtonIndex(button, index),
+                text,
+                button,
+                element: uniqueLiveElement,
+                isActive: button.hasAttribute('data-toc-active')
+            };
+        });
+    }
+
+    function getChatGptNativeTocEntryForIndex(index) {
+        return getChatGptNativeTocEntries().find((entry) => entry.index === index) || null;
+    }
+
+    function getChatGptActiveNativeTocIndex() {
+        const buttons = getChatGptNativeTocButtons();
+        const activeButton = buttons.find((button) => button.hasAttribute('data-toc-active'));
+        if (!activeButton) return null;
+
+        const buttonIndex = buttons.indexOf(activeButton);
+        return getChatGptNativeTocButtonIndex(activeButton, buttonIndex);
+    }
+
+    function annotateMessagesWithNativeToc(messages) {
+        if (!window.location.hostname.includes('chatgpt.com') || !messages.length) return messages;
+
+        const entries = getChatGptNativeTocEntries();
+        if (!entries.length) return messages;
+
+        const used = new Set();
+        messages.forEach((message, messageIndex) => {
+            const remoteIndex = getMessageRemoteIndex(message, messageIndex);
+            let entry = entries.find((entry) => entry.index === remoteIndex && !used.has(entry.index));
+            if (!entry) {
+                entry = entries.find((candidate) => {
+                    if (used.has(candidate.index)) return false;
+                    return isCompatibleNativeTocText(message.text, candidate.text);
+                });
+            }
+            if (!entry) return;
+
+            used.add(entry.index);
+            message.nativeTocIndex = entry.index;
+            message.nativeTocText = entry.text;
+            message.navigationId = `chatgpt-native-user-query::${entry.index}`;
+            if (entry.element) {
+                const domIdentityKey = getMessageIdentityKeyFromElement(entry.element);
+                if (domIdentityKey) {
+                    message.identityKeys = createMessageIdentityKeys.apply(
+                        null,
+                        getMessageIdentityKeys(message).concat([domIdentityKey])
+                    );
+                    message.identityKey = message.identityKeys[0] || message.identityKey;
+                    message.anchor = entry.element;
+                    message.container = ADAPTER ? ADAPTER.resolveMessageContainer(entry.element) : entry.element;
+                    message.anchorSource = 'native-toc';
+                }
+            }
+        });
+
+        return messages;
+    }
+
+    function collectChatGptNativeTocMessages() {
+        const entries = getChatGptNativeTocEntries();
+        return entries
+            .filter((entry) => entry.text && entry.text.trim())
+            .map((entry) => {
+                const identityKey = entry.element ? getMessageIdentityKeyFromElement(entry.element) : '';
+                const message = {
+                    container: entry.element || null,
+                    anchor: entry.element || null,
+                    text: entry.text,
+                    identityKey,
+                    identityKeys: createMessageIdentityKeys(identityKey),
+                    nativeTocIndex: entry.index,
+                    nativeTocText: entry.text,
+                    navigationId: `chatgpt-native-user-query::${entry.index}`,
+                    source: 'chatgpt-native-toc',
+                    anchorSource: entry.element ? 'native-toc' : 'native-toc-button'
+                };
+                return message;
+            });
+    }
+
+    function getChatGptConversationIdFromText(text) {
+        if (!text) return '';
+
+        const patterns = [
+            /\/c\/([0-9a-f-]{20,})/i,
+            /\/backend-api\/conversation\/([0-9a-f-]{20,})/i,
+            /[?&]conversation_id=([0-9a-f-]{20,})/i
+        ];
+
+        for (let i = 0; i < patterns.length; i++) {
+            const match = text.match(patterns[i]);
+            if (match && match[1]) return match[1];
+        }
+
+        return '';
+    }
+
+    function getChatGptConversationId() {
+        if (!window.location.hostname.includes('chatgpt.com')) return '';
+
+        try {
+            const params = new URLSearchParams(window.location.search);
+            const queryId = params.get('conversation_id');
+            if (queryId) return queryId;
+        } catch (error) {
+            // URLSearchParams can fail on malformed extension URLs; path parsing still covers normal pages.
+        }
+
+        return getChatGptConversationIdFromText(window.location.href);
+    }
+
+    function getMessageIdentityKeyFromElement(element) {
+        if (!element || !element.getAttribute) return '';
+
+        const directId = element.getAttribute('data-message-id');
+        if (directId) return `message:${directId}`;
+
+        const closest = element.closest ? element.closest('[data-message-id]') : null;
+        const closestId = closest ? closest.getAttribute('data-message-id') : '';
+        return closestId ? `message:${closestId}` : '';
+    }
+
+    function createMessageIdentityKeys() {
+        const seen = new Set();
+        const keys = [];
+
+        for (let i = 0; i < arguments.length; i++) {
+            const id = arguments[i];
+            if (!id) continue;
+
+            const key = String(id).startsWith('message:') ? String(id) : `message:${id}`;
+            if (seen.has(key)) continue;
+
+            seen.add(key);
+            keys.push(key);
+        }
+
+        return keys;
+    }
+
+    function getMessageIdentityKeys(message) {
+        if (!message) return [];
+
+        const keys = [];
+        if (Array.isArray(message.identityKeys)) keys.push(...message.identityKeys);
+        if (message.identityKey) keys.push(message.identityKey);
+
+        const elementKey = getMessageIdentityKeyFromElement(getMessageTarget(message));
+        if (elementKey) keys.push(elementKey);
+
+        return createMessageIdentityKeys.apply(null, keys);
+    }
+
+    function getMessageIdentityKey(message) {
+        const keys = getMessageIdentityKeys(message);
+        return keys[0] || '';
+    }
+
+    function getMessageIdFromIdentityKey(identityKey) {
+        return identityKey && identityKey.indexOf('message:') === 0 ? identityKey.slice(8) : '';
+    }
+
+    function escapeCssValue(value) {
+        if (window.CSS && typeof window.CSS.escape === 'function') {
+            return window.CSS.escape(value);
+        }
+        return String(value).replace(/["\\]/g, '\\$&');
+    }
+
+    function getChatGptMessageCacheContext() {
+        const conversationId = getChatGptConversationId();
+        if (conversationId) return `chatgpt:${conversationId}`;
+        return `${window.location.hostname}${window.location.pathname}${window.location.search}`;
+    }
+
+    function flattenConversationPart(part) {
+        if (typeof part === 'string') return part;
+        if (!part) return '';
+
+        if (Array.isArray(part)) {
+            return part.map(flattenConversationPart).filter(Boolean).join(' ');
+        }
+
+        if (typeof part !== 'object') return '';
+        if (typeof part.text === 'string') return part.text;
+        if (typeof part.content === 'string') return part.content;
+        if (Array.isArray(part.parts)) return flattenConversationPart(part.parts);
+        if (Array.isArray(part.content)) return flattenConversationPart(part.content);
+        if (part.content_type && /image/i.test(String(part.content_type))) return '[image]';
+        return '';
+    }
+
+    function getConversationMessageText(message) {
+        if (!message || !message.content) return '';
+
+        const content = message.content;
+        if (Array.isArray(content.parts)) {
+            return normalizePlainText(content.parts.map(flattenConversationPart).filter(Boolean).join(' '));
+        }
+
+        return normalizePlainText(flattenConversationPart(content));
+    }
+
+    function getConversationPathNodes(data) {
+        const mapping = data && data.mapping ? data.mapping : null;
+        if (!mapping) return [];
+
+        if (data.current_node && mapping[data.current_node]) {
+            const path = [];
+            const seen = new Set();
+            let node = mapping[data.current_node];
+
+            while (node && !seen.has(node.id)) {
+                seen.add(node.id);
+                path.push(node);
+                node = node.parent ? mapping[node.parent] : null;
+            }
+
+            return path.reverse();
+        }
+
+        return Object.keys(mapping)
+            .map((key) => mapping[key])
+            .sort((a, b) => {
+                const aTime = a && a.message && typeof a.message.create_time === 'number' ? a.message.create_time : 0;
+                const bTime = b && b.message && typeof b.message.create_time === 'number' ? b.message.create_time : 0;
+                return aTime - bTime;
+            });
+    }
+
+    function getAllConversationNodes(data) {
+        const mapping = data && data.mapping ? data.mapping : null;
+        if (!mapping) return [];
+
+        return Object.keys(mapping)
+            .map((key) => mapping[key])
+            .sort((a, b) => {
+                const aTime = a && a.message && typeof a.message.create_time === 'number' ? a.message.create_time : 0;
+                const bTime = b && b.message && typeof b.message.create_time === 'number' ? b.message.create_time : 0;
+                return aTime - bTime;
+            });
+    }
+
+    function shouldUseConversationMessage(message) {
+        if (!message) return false;
+        const metadata = message.metadata || {};
+        return !metadata.is_visually_hidden_from_conversation && !metadata.is_hidden;
+    }
+
+    function extractChatGptUserMessagesFromNodes(nodes) {
+        const seen = new Set();
+        return nodes.reduce((messages, node) => {
+            const message = node && node.message;
+            const role = message && message.author ? message.author.role : '';
+            if (role !== 'user') return messages;
+            if (!shouldUseConversationMessage(message)) return messages;
+
+            const text = getConversationMessageText(message);
+            if (!text) return messages;
+
+            const identityKeys = createMessageIdentityKeys(message.id, node.id);
+            const seenKey = identityKeys[0] || '';
+            if (seenKey && seen.has(seenKey)) return messages;
+            if (seenKey) seen.add(seenKey);
+
+            messages.push({
+                container: null,
+                anchor: null,
+                text,
+                identityKey: seenKey,
+                identityKeys,
+                source: 'conversation'
+            });
+            return messages;
+        }, []);
+    }
+
+    function extractChatGptUserMessages(data) {
+        const pathMessages = extractChatGptUserMessagesFromNodes(getConversationPathNodes(data));
+        const allMessages = extractChatGptUserMessagesFromNodes(getAllConversationNodes(data));
+        return allMessages.length > pathMessages.length ? allMessages : pathMessages;
+    }
+
+    function applyChatGptConversationData(data, source, contextOverride) {
+        const messages = extractChatGptUserMessages(data);
+        if (!messages.length) {
+            if (!STATE.remoteMessages.length) {
+                STATE.remoteFetchStatus = `${source}:empty`;
+            }
+            return false;
+        }
+
+        STATE.remoteMessages = messages;
+        STATE.remoteMessageContext = contextOverride || getChatGptMessageCacheContext();
+        STATE.remoteMessageSource = source;
+        STATE.remoteFetchStatus = `${source}:ok:${messages.length}`;
+        scheduleScan(0);
+        return true;
+    }
+
+    function alignLiveMessagesByComparableText(remoteMessages, liveMessages) {
+        const liveByRemoteIndex = new Map();
+        const usedRemoteIndexes = new Set();
+        let nextRemoteIndex = 0;
+
+        liveMessages.forEach((liveMessage) => {
+            const liveText = getComparableMessageText(liveMessage.text);
+            if (!liveText) return;
+
+            let matchedIndex = -1;
+            let matchType = '';
+            for (let i = nextRemoteIndex; i < remoteMessages.length; i++) {
+                if (usedRemoteIndexes.has(i)) continue;
+                const remoteText = getComparableMessageText(remoteMessages[i].text);
+                if (!isComparableTextMatch(remoteText, liveText)) continue;
+
+                matchedIndex = i;
+                matchType = remoteText === liveText ? 'exact-text-order' : 'contained-text-order';
+                break;
+            }
+
+            if (matchedIndex < 0) return;
+
+            usedRemoteIndexes.add(matchedIndex);
+            liveByRemoteIndex.set(matchedIndex, liveMessage);
+            liveMessage.remoteIndex = matchedIndex;
+            liveMessage.anchorSource = matchType;
+            nextRemoteIndex = matchedIndex + 1;
+        });
+
+        return liveByRemoteIndex;
+    }
+
+    function getTextAlignmentPreview() {
+        const remoteTexts = STATE.remoteMessages.map((message) => getComparableMessageText(message.text));
+        let nextRemoteIndex = 0;
+
+        return Array.from(document.querySelectorAll('[data-message-author-role="user"]')).map((element, liveIndex) => {
+            const liveText = normalizeMessageText(element);
+            const comparable = getComparableMessageText(liveText);
+            let matchedRemoteIndex = -1;
+
+            for (let i = nextRemoteIndex; i < remoteTexts.length; i++) {
+                if (!isComparableTextMatch(remoteTexts[i], comparable)) continue;
+                matchedRemoteIndex = i;
+                nextRemoteIndex = i + 1;
+                break;
+            }
+
+            return {
+                liveIndex,
+                matchedRemoteIndex,
+                liveText: liveText.slice(0, 80),
+                remoteText: matchedRemoteIndex >= 0 ? STATE.remoteMessages[matchedRemoteIndex].text.slice(0, 80) : ''
+            };
+        });
+    }
+
+    function getCurrentTextAlignmentMatches() {
+        const remoteTexts = STATE.remoteMessages.map((message) => getComparableMessageText(message.text));
+        let nextRemoteIndex = 0;
+
+        return Array.from(document.querySelectorAll('[data-message-author-role="user"]')).reduce((matches, element, liveIndex) => {
+            const liveText = normalizeMessageText(element);
+            const comparable = getComparableMessageText(liveText);
+            let matchedRemoteIndex = -1;
+            let matchType = '';
+
+            for (let i = nextRemoteIndex; i < remoteTexts.length; i++) {
+                if (!isComparableTextMatch(remoteTexts[i], comparable)) continue;
+                matchedRemoteIndex = i;
+                matchType = remoteTexts[i] === comparable ? 'exact-text-order' : 'contained-text-order';
+                nextRemoteIndex = i + 1;
+                break;
+            }
+
+            if (matchedRemoteIndex >= 0) {
+                matches.push({
+                    element,
+                    liveIndex,
+                    remoteIndex: matchedRemoteIndex,
+                    source: matchType,
+                    liveText
+                });
+            }
+
+            return matches;
+        }, []);
+    }
+
+    function mergeRemoteAndLiveMessages(remoteMessages, liveMessages) {
+        if (!remoteMessages.length) return liveMessages;
+
+        const liveByIdentity = new Map();
+        const liveByRemoteIndex = alignLiveMessagesByComparableText(remoteMessages, liveMessages);
+        const usedLiveMessages = new Set();
+
+        liveMessages.forEach((message) => {
+            const keys = getMessageIdentityKeys(message);
+            if (!keys.length) return;
+
+            message.identityKey = keys[0];
+            message.identityKeys = keys;
+
+            keys.forEach((key) => {
+                if (!liveByIdentity.has(key)) liveByIdentity.set(key, message);
+            });
+        });
+
+        const merged = remoteMessages.map((remoteMessage, remoteIndex) => {
+            const keys = getMessageIdentityKeys(remoteMessage);
+            const key = keys[0] || '';
+            let liveMessage = null;
+            let anchorSource = '';
+
+            for (let i = 0; i < keys.length; i++) {
+                liveMessage = liveByIdentity.get(keys[i]);
+                if (liveMessage) {
+                    anchorSource = 'id';
+                    break;
+                }
+            }
+
+            if (!liveMessage) {
+                liveMessage = liveByRemoteIndex.get(remoteIndex) || null;
+                if (liveMessage) anchorSource = liveMessage.anchorSource || 'text-order';
+            }
+
+            if (!liveMessage) return {
+                container: null,
+                anchor: null,
+                text: remoteMessage.text,
+                identityKey: key,
+                identityKeys: keys,
+                remoteIndex,
+                source: remoteMessage.source
+            };
+
+            usedLiveMessages.add(liveMessage);
+            return {
+                container: liveMessage.container,
+                anchor: liveMessage.anchor,
+                text: liveMessage.text || remoteMessage.text,
+                identityKey: key,
+                identityKeys: keys,
+                remoteIndex,
+                anchorSource,
+                source: 'live'
+            };
+        });
+
+        liveMessages.forEach((message) => {
+            if (!usedLiveMessages.has(message)) merged.push(message);
+        });
+
+        return merged;
+    }
+
+    function hydrateChatGptConversationMessages() {
+        const conversationId = getChatGptConversationId();
+        if (!conversationId || STATE.remoteFetchInFlight) return;
+
+        const context = getChatGptMessageCacheContext();
+        if (STATE.remoteFetchContext === context) return;
+
+        STATE.remoteFetchContext = context;
+        STATE.remoteFetchInFlight = true;
+        STATE.remoteFetchStatus = 'direct:loading';
+
+        fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+            credentials: 'include'
+        })
+            .then((response) => response.ok ? response.json() : null)
+            .then((data) => {
+                if (!data) {
+                    STATE.remoteFetchStatus = 'direct:empty-response';
+                    return;
+                }
+                applyChatGptConversationData(data, 'direct', context);
+            })
+            .catch(() => {
+                STATE.remoteFetchContext = '';
+                STATE.remoteFetchStatus = 'direct:error';
+            })
+            .finally(() => {
+                STATE.remoteFetchInFlight = false;
+            });
+    }
+
+    function isChatGptConversationResponseUrl(url) {
+        return !!(url && /\/backend-api\/conversation\/[0-9a-f-]{20,}/i.test(url));
+    }
+
+    function readConversationResponse(response, source) {
+        if (!response || !isChatGptConversationResponseUrl(response.url)) return;
+
+        const conversationId = getChatGptConversationIdFromText(response.url);
+        const context = conversationId ? `chatgpt:${conversationId}` : getChatGptMessageCacheContext();
+
+        response.clone().json()
+            .then((data) => applyChatGptConversationData(data, source, context))
+            .catch(() => {
+                STATE.remoteFetchStatus = `${source}:read-error`;
+            });
+    }
+
+    function installChatGptConversationInterceptors() {
+        if (!window.location.hostname.includes('chatgpt.com')) return;
+        if (STATE.conversationInterceptorInstalled) return;
+        STATE.conversationInterceptorInstalled = true;
+
+        const pageWindow = getPageWindow();
+        const originalFetch = pageWindow.fetch;
+        if (typeof originalFetch === 'function') {
+            pageWindow.fetch = function interceptedFetch() {
+                const result = originalFetch.apply(this, arguments);
+                Promise.resolve(result)
+                    .then((response) => readConversationResponse(response, 'page-fetch'))
+                    .catch(() => {});
+                return result;
+            };
+        }
+
+        const OriginalXHR = pageWindow.XMLHttpRequest;
+        if (typeof OriginalXHR === 'function' && OriginalXHR.prototype && !OriginalXHR.prototype.__aiTocConversationPatched) {
+            const xhrProto = OriginalXHR.prototype;
+            const originalOpen = xhrProto.open;
+            const originalSend = xhrProto.send;
+
+            xhrProto.open = function interceptedOpen(method, url) {
+                this.__aiTocConversationUrl = typeof url === 'string' ? url : String(url || '');
+                return originalOpen.apply(this, arguments);
+            };
+
+            xhrProto.send = function interceptedSend() {
+                if (!this.__aiTocConversationListener) {
+                    this.__aiTocConversationListener = true;
+                    this.addEventListener('load', () => {
+                        const requestUrl = this.__aiTocConversationUrl || '';
+                        if (!isChatGptConversationResponseUrl(requestUrl)) return;
+
+                        try {
+                            const data = JSON.parse(this.responseText);
+                            const conversationId = getChatGptConversationIdFromText(requestUrl);
+                            const context = conversationId ? `chatgpt:${conversationId}` : getChatGptMessageCacheContext();
+                            applyChatGptConversationData(data, 'page-xhr', context);
+                        } catch (error) {
+                            STATE.remoteFetchStatus = 'page-xhr:read-error';
+                        }
+                    });
+                }
+
+                return originalSend.apply(this, arguments);
+            };
+
+            xhrProto.__aiTocConversationPatched = true;
+        }
+    }
+
+    function exposeDebugInfo() {
+        const pageWindow = getPageWindow();
+        const debugFn = function aiTocDebug() {
+            const alignmentMatches = getCurrentTextAlignmentMatches();
+            const liveSamples = Array.from(document.querySelectorAll('[data-message-author-role="user"]')).map((element, index) => {
+                const text = normalizeMessageText(element);
+                return {
+                    index,
+                    identityKey: getMessageIdentityKeyFromElement(element),
+                    text: text.slice(0, 120),
+                    comparable: getComparableMessageText(text).slice(0, 120)
+                };
+            });
+            const remoteSamples = STATE.remoteMessages.map((message, index) => ({
+                index,
+                identityKeys: getMessageIdentityKeys(message),
+                text: message.text.slice(0, 120),
+                comparable: getComparableMessageText(message.text).slice(0, 120)
+            }));
+            const nativeTocSamples = getChatGptNativeTocEntries().map((entry) => ({
+                index: entry.index,
+                text: entry.text.slice(0, 120),
+                hasElement: !!(entry.element && entry.element.isConnected),
+                isActive: entry.isActive
+            }));
+
+            return {
+                version: '2.7.0',
+                conversationId: getChatGptConversationId(),
+                url: window.location.href,
+                liveDomUserMessages: document.querySelectorAll('[data-message-author-role="user"]').length,
+                nativeTocMessages: getChatGptNativeTocEntries().length,
+                tocMessages: STATE.messages.length,
+                remoteMessages: STATE.remoteMessages.length,
+                remoteMessageContext: STATE.remoteMessageContext,
+                remoteMessageSource: STATE.remoteMessageSource,
+                remoteFetchContext: STATE.remoteFetchContext,
+                remoteFetchInFlight: STATE.remoteFetchInFlight,
+                remoteFetchStatus: STATE.remoteFetchStatus,
+                interceptorInstalled: STATE.conversationInterceptorInstalled,
+                exactTextOrderAnchors: STATE.messages.filter((message) => message.anchorSource === 'exact-text-order').length,
+                containedTextOrderAnchors: STATE.messages.filter((message) => message.anchorSource === 'contained-text-order').length,
+                textOrderAnchors: STATE.messages.filter((message) => /text-order$/.test(message.anchorSource || '')).length,
+                currentTextAlignmentMatches: alignmentMatches.map((match) => ({
+                    liveIndex: match.liveIndex,
+                    remoteIndex: match.remoteIndex,
+                    source: match.source,
+                    liveText: match.liveText.slice(0, 80)
+                })),
+                slotSummary: getChatGptMessageSlotSummary(),
+                alignmentPreview: getTextAlignmentPreview(),
+                liveSamples,
+                remoteSamples,
+                nativeTocSamples,
+                lastTocClick: STATE.lastTocClick,
+                lastNavigationDebug: STATE.lastNavigationDebug
+            };
+        };
+        window.__aiTocDebug = debugFn;
+        window.__aiTocVersion = '2.7.0';
+        pageWindow.__aiTocDebug = debugFn;
+        pageWindow.__aiTocVersion = '2.7.0';
+    }
+
     function collectMessagesFromAdapter(adapter) {
+        if (adapter.beforeCollect) adapter.beforeCollect();
+
         const allLines = Array.from(document.querySelectorAll(adapter.selector));
         const messages = [];
         let currentGroup = null;
@@ -169,7 +942,13 @@
             }
 
             if (currentGroup) messages.push(currentGroup);
-            currentGroup = { container, anchor: line, text };
+            currentGroup = {
+                container,
+                anchor: line,
+                text,
+                identityKey: getMessageIdentityKeyFromElement(line),
+                identityKeys: createMessageIdentityKeys(getMessageIdentityKeyFromElement(line))
+            };
         });
 
         if (currentGroup) messages.push(currentGroup);
@@ -181,6 +960,10 @@
         if (extraMessages.length) {
             messages.push(...extraMessages);
             messages.sort(compareMessageOrder);
+        }
+
+        if (adapter.mergeMessages) {
+            return adapter.mergeMessages(messages);
         }
 
         return messages;
@@ -197,11 +980,12 @@
 
     function getDefaultScrollReferenceTargets(messages, selector) {
         if (messages.length) {
-            return [
+            const targets = [
                 getMessageTarget(messages[0]),
                 getMessageTarget(messages[(messages.length - 1) >> 1]),
                 getMessageTarget(messages[messages.length - 1])
             ].filter(Boolean);
+            if (targets.length) return targets;
         }
 
         const fallback = document.querySelector(selector);
@@ -216,6 +1000,28 @@
             matches() {
                 return window.location.hostname.includes('chatgpt.com');
             },
+            beforeCollect() {
+                const nativeTocMessages = getChatGptNativeTocEntries();
+                if (nativeTocMessages.length) {
+                    STATE.remoteMessages = [];
+                    STATE.remoteMessageContext = 'disabled:native-toc';
+                    STATE.remoteMessageSource = '';
+                    STATE.remoteFetchContext = '';
+                    STATE.remoteFetchStatus = 'disabled:native-toc';
+                    return;
+                }
+
+                const context = getChatGptMessageCacheContext();
+                if (STATE.remoteMessageContext && STATE.remoteMessageContext !== context) {
+                    STATE.remoteMessages = [];
+                    STATE.remoteMessageContext = '';
+                    STATE.remoteMessageSource = '';
+                    STATE.remoteFetchContext = '';
+                    STATE.remoteFetchStatus = '';
+                }
+
+                hydrateChatGptConversationMessages();
+            },
             resolveMessageContainer(line) {
                 return line.closest('[data-message-author-role]') || resolveGroupedMessageContainer(line, this.selector);
             },
@@ -228,6 +1034,13 @@
             },
             collectExtraMessages() {
                 return [];
+            },
+            mergeMessages(liveMessages) {
+                const nativeTocMessages = collectChatGptNativeTocMessages();
+                if (nativeTocMessages.length) return nativeTocMessages;
+                const context = getChatGptMessageCacheContext();
+                if (STATE.remoteMessageContext !== context) return liveMessages;
+                return mergeRemoteAndLiveMessages(STATE.remoteMessages, liveMessages);
             }
         },
         gemini: {
@@ -566,6 +1379,18 @@
         } else {
             target.scrollTop = nextTop;
         }
+    }
+
+    function scrollTargetToInstant(target, top) {
+        const nextTop = Math.max(0, Math.min(typeof top === 'number' ? top : 0, getScrollMaxTop(target)));
+        if (isWindowScrollTarget(target)) {
+            window.scrollTo(0, nextTop);
+            const pageScroller = getPageScroller();
+            if (pageScroller) pageScroller.scrollTop = nextTop;
+            return;
+        }
+
+        target.scrollTop = nextTop;
     }
 
     function findScrollContainerForElement(element) {
@@ -1026,6 +1851,18 @@
         return Math.max(0, Math.min(currentTop + rect.top - viewport.top - offset + activationBias, getScrollMaxTop(container)));
     }
 
+    function getExactUserElementScrollTop(target, container) {
+        if (!target || !target.isConnected) return;
+        const viewport = getViewportRect(container);
+        const rect = target.getBoundingClientRect();
+        const offset = Math.min(24, viewport.height * 0.06);
+        return Math.max(0, Math.min(getScrollTop(container) + rect.top - viewport.top - offset, getScrollMaxTop(container)));
+    }
+
+    function isExactUserTarget(target) {
+        return !!(target && target.matches && target.matches('[data-message-author-role="user"]'));
+    }
+
     function getMessageScrollTopByIndex(index, container) {
         if (index < 0 || index >= STATE.messages.length) return;
 
@@ -1068,6 +1905,13 @@
         }
     }
 
+    function clearVirtualSeekTimer() {
+        if (STATE.virtualSeekTimer) {
+            window.clearTimeout(STATE.virtualSeekTimer);
+            STATE.virtualSeekTimer = 0;
+        }
+    }
+
     function scheduleJumpCorrection(target, remainingAttempts, index) {
         clearJumpSyncTimer();
         if (!target || !target.isConnected || remainingAttempts <= 0) return;
@@ -1077,7 +1921,9 @@
             const currentContainer = findScrollContainerForElement(target);
             if (STATE.scrollContainer !== currentContainer) bindScrollSync();
 
-            const exactTop = resolveTargetScrollTop(target, currentContainer, index);
+            const exactTop = isExactUserTarget(target)
+                ? getExactUserElementScrollTop(target, currentContainer)
+                : resolveTargetScrollTop(target, currentContainer, index);
             if (typeof exactTop !== 'number') return;
 
             const currentTop = getScrollTop(currentContainer);
@@ -1100,8 +1946,917 @@
         const initialTop = resolveTargetScrollTop(target, container, index);
         if (typeof initialTop !== 'number') return;
 
-        scrollTargetTo(container, initialTop, 'smooth');
+        scrollTargetTo(container, initialTop, 'auto');
         scheduleJumpCorrection(target, 4, index);
+    }
+
+    function findLiveUserElementByIdentityKeys(identityKeys) {
+        if (!identityKeys || !identityKeys.length) return null;
+
+        for (let i = 0; i < identityKeys.length; i++) {
+            const messageId = getMessageIdFromIdentityKey(identityKeys[i]);
+            if (!messageId) continue;
+
+            const escapedId = escapeCssValue(messageId);
+            const direct = document.querySelector(`[data-message-author-role="user"][data-message-id="${escapedId}"]`);
+            if (direct && direct.isConnected) return direct;
+        }
+
+        const users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+        for (let i = 0; i < users.length; i++) {
+            const key = getMessageIdentityKeyFromElement(users[i]);
+            if (identityKeys.includes(key)) return users[i];
+        }
+
+        return null;
+    }
+
+    function isExactTextAnchorForMessage(element, message) {
+        if (!element || !message) return false;
+        if (!element.matches || !element.matches('[data-message-author-role="user"]')) return false;
+        return isComparableTextMatch(
+            getComparableMessageText(message.text),
+            getComparableMessageText(normalizeMessageText(element))
+        );
+    }
+
+    function findLiveUserElementForMessage(message, index) {
+        const identityMatch = findLiveUserElementByIdentityKeys(getMessageIdentityKeys(message));
+        if (identityMatch) return { element: identityMatch, source: 'id' };
+
+        const slotMatch = findLiveUserElementInSlot(message, index);
+        if (slotMatch) return slotMatch;
+
+        return null;
+    }
+
+    function scrollExactUserElementIntoView(element, index, behavior) {
+        if (!element || !element.isConnected) return false;
+
+        const container = findScrollContainerForElement(element);
+        if (STATE.scrollContainer !== container) bindScrollSync();
+
+        const exactTop = getExactUserElementScrollTop(element, container);
+        if (typeof exactTop !== 'number') return false;
+
+        if (behavior === 'smooth') {
+            scrollTargetTo(container, exactTop, 'smooth');
+        } else {
+            scrollTargetToInstant(container, exactTop);
+        }
+        const rect = element.getBoundingClientRect();
+        if (STATE.lastNavigationDebug && typeof STATE.lastNavigationDebug === 'object') {
+            STATE.lastNavigationDebug.finalRect = {
+                top: Math.round(rect.top),
+                bottom: Math.round(rect.bottom),
+                height: Math.round(rect.height)
+            };
+        }
+
+        scheduleActiveSync();
+        return true;
+    }
+
+    function pokeChatGptLazyMount(container, slot) {
+        if (slot && slot.isConnected) {
+            slot.getBoundingClientRect();
+        }
+        if (container && !isWindowScrollTarget(container)) {
+            container.dispatchEvent(new Event('scroll', { bubbles: true }));
+        }
+        window.dispatchEvent(new Event('scroll'));
+        window.dispatchEvent(new Event('resize'));
+        if (slot && slot.isConnected) {
+            window.requestAnimationFrame(() => {
+                slot.getBoundingClientRect();
+                if (container && !isWindowScrollTarget(container)) {
+                    container.dispatchEvent(new Event('scroll', { bubbles: true }));
+                }
+            });
+        }
+    }
+
+    function getMessageAbsoluteTop(message, container) {
+        const target = getMessageTarget(message);
+        if (!target || !target.isConnected) return;
+
+        const viewport = getViewportRect(container);
+        const rect = target.getBoundingClientRect();
+        return getScrollTop(container) + rect.top - viewport.top;
+    }
+
+    function getElementAbsoluteTop(element, container) {
+        if (!element || !element.isConnected) return;
+
+        const viewport = getViewportRect(container);
+        const rect = element.getBoundingClientRect();
+        return getScrollTop(container) + rect.top - viewport.top;
+    }
+
+    function getMessageRemoteIndex(message, index) {
+        return message && typeof message.remoteIndex === 'number' ? message.remoteIndex : index;
+    }
+
+    function getChatGptMessageSlotRoot() {
+        return document.querySelector('[class*="convSearchResultHighlightRoot"]');
+    }
+
+    function getChatGptTurnShellSortIndex(element, fallback) {
+        const testId = element.getAttribute('data-testid') || '';
+        const match = /^conversation-turn-(\d+)/.exec(testId);
+        if (match && match[1]) {
+            const parsed = Number.parseInt(match[1], 10);
+            if (!Number.isNaN(parsed)) return parsed;
+        }
+        return fallback;
+    }
+
+    function getChatGptTurnShells() {
+        const root = document.querySelector('#thread, main#main') || document;
+        const selector = [
+            'section[data-turn]',
+            '[data-testid^="conversation-turn"]',
+            '[data-turn-id-container]',
+            '[data-turn-id]'
+        ].join(', ');
+        const shells = Array.from(root.querySelectorAll(selector))
+            .filter((element) => {
+                if (!(element instanceof HTMLElement)) return false;
+                if (element.closest('#ai-toc-v2_2, .gh-root, .gh-main-panel')) return false;
+                return true;
+            })
+            .filter((element, index, all) => !all.some((other) => other !== element && other.contains(element)));
+
+        return shells
+            .map((element, index) => ({ element, index: getChatGptTurnShellSortIndex(element, index) }))
+            .sort((a, b) => a.index - b.index)
+            .map((item) => item.element);
+    }
+
+    function getChatGptTurnShellByIdentityKeys(identityKeys) {
+        if (!identityKeys || !identityKeys.length) return null;
+
+        const root = document.querySelector('#thread, main#main') || document;
+        for (let i = 0; i < identityKeys.length; i++) {
+            const id = getMessageIdFromIdentityKey(identityKeys[i]);
+            if (!id) continue;
+
+            const escapedId = escapeCssValue(id);
+            const shell = root.querySelector(
+                `[data-turn-id-container="${escapedId}"], [data-turn-id="${escapedId}"]`
+            );
+            if (shell instanceof HTMLElement && shell.isConnected) return shell;
+        }
+
+        return null;
+    }
+
+    function getChatGptTurnShellRole(shell) {
+        if (!shell) return '';
+        const directTurn = shell.getAttribute('data-turn') || '';
+        if (directTurn) return directTurn;
+
+        const roleElement = getChatGptSlotRoleElement(shell);
+        return roleElement ? roleElement.getAttribute('data-message-author-role') || '' : '';
+    }
+
+    function getChatGptUserTurnShellElement(remoteIndex) {
+        if (typeof remoteIndex !== 'number' || remoteIndex < 0) return null;
+
+        const shells = getChatGptTurnShells();
+        if (!shells.length) return null;
+
+        const explicitUserShells = shells.filter((shell) => getChatGptTurnShellRole(shell) === 'user');
+        if (explicitUserShells[remoteIndex]) return explicitUserShells[remoteIndex];
+
+        const alternatingUserIndex = remoteIndex * 2;
+        if (shells.length >= alternatingUserIndex + 1) return shells[alternatingUserIndex];
+
+        const expectedUserCount = STATE.messages.length || STATE.remoteMessages.length || 0;
+        if (expectedUserCount > 0 && shells.length >= expectedUserCount) return shells[remoteIndex] || null;
+        return null;
+    }
+
+    function getChatGptUserSlotElement(remoteIndex) {
+        const root = getChatGptMessageSlotRoot();
+        if (root && typeof remoteIndex === 'number' && remoteIndex >= 0) {
+            const slot = root.children[1 + remoteIndex * 2] || null;
+            if (slot) return slot;
+        }
+        return getChatGptUserTurnShellElement(remoteIndex);
+    }
+
+    function getChatGptSlotSource(slot, remoteIndex) {
+        if (!slot) return '';
+
+        if (slot.matches && slot.matches('[data-turn-id-container], [data-turn-id]')) {
+            return 'turn-id';
+        }
+
+        const root = getChatGptMessageSlotRoot();
+        if (root && typeof remoteIndex === 'number' && root.children[1 + remoteIndex * 2] === slot) {
+            return 'conv-root';
+        }
+        return getChatGptTurnShells().includes(slot) ? 'turn-shell' : 'unknown';
+    }
+
+    function getChatGptSlotRoleElement(slot, role) {
+        if (!slot || !slot.isConnected) return null;
+
+        const selector = role
+            ? `[data-message-author-role="${escapeCssValue(role)}"]`
+            : '[data-message-author-role]';
+        if (slot.matches && slot.matches(selector)) return slot;
+        return slot.querySelector ? slot.querySelector(selector) : null;
+    }
+
+    function getChatGptSlotDebug(slot) {
+        const roleElement = getChatGptSlotRoleElement(slot);
+        const rect = slot && slot.getBoundingClientRect ? slot.getBoundingClientRect() : null;
+        return {
+            role: roleElement ? roleElement.getAttribute('data-message-author-role') : '',
+            messageId: roleElement ? roleElement.getAttribute('data-message-id') : '',
+            turnId: slot && slot.getAttribute ? (slot.getAttribute('data-turn-id-container') || slot.getAttribute('data-turn-id') || '') : '',
+            text: roleElement ? normalizeMessageText(roleElement).slice(0, 80) : '',
+            top: rect ? Math.round(rect.top) : null,
+            height: rect ? Math.round(rect.height) : null,
+            hasLastKnownHeight: !!(slot && String(slot.className || '').includes('last-known-height'))
+        };
+    }
+
+    function findLiveUserElementInSlot(message, index) {
+        if (!message) return null;
+
+        const remoteIndex = getMessageRemoteIndex(message, index);
+        const slot = getChatGptUserSlotElement(remoteIndex);
+        if (!slot || !slot.isConnected) return null;
+
+        const userElement = getChatGptSlotRoleElement(slot, 'user');
+        if (!userElement || !userElement.isConnected) return null;
+
+        const identityKeys = getMessageIdentityKeys(message);
+        const domIdentityKey = getMessageIdentityKeyFromElement(userElement);
+        if (domIdentityKey && identityKeys.includes(domIdentityKey)) {
+            return {
+                element: userElement,
+                source: 'slot-id',
+                liveIndex: null,
+                domIdentityKey,
+                slotText: normalizeMessageText(userElement).slice(0, 80)
+            };
+        }
+
+        const remoteText = getComparableMessageText(message.text);
+        const liveText = getComparableMessageText(normalizeMessageText(userElement));
+        const textMatches = isComparableTextMatch(remoteText, liveText);
+        if (!textMatches) return null;
+
+        if (domIdentityKey) {
+            message.identityKeys = createMessageIdentityKeys.apply(
+                null,
+                identityKeys.concat([domIdentityKey])
+            );
+        }
+
+        return {
+            element: userElement,
+            source: 'slot-text-id',
+            liveIndex: null,
+            domIdentityKey: domIdentityKey || '',
+            slotText: normalizeMessageText(userElement).slice(0, 80)
+        };
+    }
+
+    function getChatGptMessageSlotSummary() {
+        const root = getChatGptMessageSlotRoot();
+        if (!root) {
+            return getChatGptTurnShells().map((element, childIndex) => {
+                const roleElement = getChatGptSlotRoleElement(element);
+                const rect = element.getBoundingClientRect();
+                return {
+                    childIndex,
+                    userIndex: getChatGptTurnShellRole(element) === 'user' ? childIndex : null,
+                    source: 'turn-shell',
+                    role: roleElement ? roleElement.getAttribute('data-message-author-role') : getChatGptTurnShellRole(element),
+                    messageId: roleElement ? roleElement.getAttribute('data-message-id') : '',
+                    text: roleElement ? normalizeMessageText(roleElement).slice(0, 80) : '',
+                    hasLastKnownHeight: String(element.className || '').includes('last-known-height'),
+                    top: Math.round(rect.top),
+                    height: Math.round(rect.height)
+                };
+            });
+        }
+
+        return Array.from(root.children).map((element, childIndex) => {
+            const roleElement = getChatGptSlotRoleElement(element);
+            const rect = element.getBoundingClientRect();
+            return {
+                childIndex,
+                userIndex: childIndex > 0 && (childIndex - 1) % 2 === 0 ? (childIndex - 1) / 2 : null,
+                source: 'conv-root',
+                role: roleElement ? roleElement.getAttribute('data-message-author-role') : '',
+                messageId: roleElement ? roleElement.getAttribute('data-message-id') : '',
+                text: roleElement ? normalizeMessageText(roleElement).slice(0, 80) : '',
+                hasLastKnownHeight: String(element.className || '').includes('last-known-height'),
+                top: Math.round(rect.top),
+                height: Math.round(rect.height)
+            };
+        });
+    }
+
+    function scrollChatGptUserSlotIntoView(remoteIndex, index, behavior) {
+        const slot = getChatGptUserSlotElement(remoteIndex);
+        if (!slot || !slot.isConnected) return false;
+
+        const container = findScrollContainerForElement(slot);
+        if (STATE.scrollContainer !== container) bindScrollSync();
+
+        const viewport = getViewportRect(container);
+        const offset = Math.max(80, viewport.height * 0.35);
+        const slotTop = getElementAbsoluteTop(slot, container);
+        if (typeof slotTop !== 'number') return false;
+
+        const nextTop = Math.max(0, Math.min(slotTop - offset, getScrollMaxTop(container)));
+        scrollTargetTo(container, nextTop, behavior || 'auto');
+        pokeChatGptLazyMount(container, slot);
+
+        STATE.lastNavigationDebug = {
+            mode: 'slot-seek',
+            index,
+            remoteIndex,
+            childIndex: 1 + remoteIndex * 2,
+            currentTop: Math.round(getScrollTop(container)),
+            nextTop: Math.round(nextTop),
+            viewportOffset: Math.round(offset),
+            slotTop: Math.round(slotTop),
+            slotHeight: Math.round(slot.getBoundingClientRect().height),
+            slotHasLastKnownHeight: String(slot.className || '').includes('last-known-height'),
+            lazyMountPoked: true
+        };
+        return true;
+    }
+
+    function estimateVirtualMessageScrollTop(index, container) {
+        const messages = STATE.messages;
+        const maxTop = getScrollMaxTop(container);
+        const viewport = getViewportRect(container);
+        const currentTop = getScrollTop(container);
+        const connected = [];
+
+        getCurrentTextAlignmentMatches().forEach((match) => {
+            const top = getElementAbsoluteTop(match.element, container);
+            if (typeof top === 'number') {
+                connected.push({
+                    index: match.remoteIndex,
+                    top,
+                    source: match.source
+                });
+            }
+        });
+
+        messages.forEach((message, messageIndex) => {
+            const top = getMessageAbsoluteTop(message, container);
+            if (typeof top === 'number') connected.push({ index: messageIndex, top, source: 'message-anchor' });
+        });
+
+        connected.sort((a, b) => {
+            if (a.index !== b.index) return a.index - b.index;
+            return a.top - b.top;
+        });
+
+        const deduped = [];
+        connected.forEach((item) => {
+            const last = deduped[deduped.length - 1];
+            if (last && last.index === item.index) return;
+            deduped.push(item);
+        });
+
+        if (!deduped.length) {
+            const ratio = messages.length > 1 ? index / (messages.length - 1) : 0;
+            return Math.max(0, Math.min(maxTop, maxTop * ratio));
+        }
+
+        const first = deduped[0];
+        const last = deduped[deduped.length - 1];
+        const step = Math.max(240, viewport.height * 0.85);
+
+        if (index < first.index) return Math.max(0, currentTop - step);
+        if (index > last.index) return Math.min(maxTop, currentTop + step);
+
+        for (let i = 0; i < deduped.length - 1; i++) {
+            const before = deduped[i];
+            const after = deduped[i + 1];
+            if (index < before.index || index > after.index) continue;
+
+            const span = Math.max(1, after.index - before.index);
+            const ratio = (index - before.index) / span;
+            return Math.max(0, Math.min(maxTop, before.top + (after.top - before.top) * ratio));
+        }
+
+        const ratio = messages.length > 1 ? index / (messages.length - 1) : 0;
+        return Math.max(0, Math.min(maxTop, maxTop * ratio));
+    }
+
+    function getDirectionalSeekScroll(index, container) {
+        const matches = getCurrentTextAlignmentMatches();
+        const maxTop = getScrollMaxTop(container);
+        const currentTop = getScrollTop(container);
+        const viewport = getViewportRect(container);
+        const step = Math.max(320, viewport.height * 0.62);
+        const visibleIndexes = matches.map((match) => match.remoteIndex);
+
+        let direction = 1;
+        let reason = 'no-visible-index';
+
+        const lower = matches
+            .filter((match) => match.remoteIndex < index)
+            .sort((a, b) => b.remoteIndex - a.remoteIndex)[0] || null;
+        const higher = matches
+            .filter((match) => match.remoteIndex > index)
+            .sort((a, b) => a.remoteIndex - b.remoteIndex)[0] || null;
+
+        if (lower && !higher) {
+            direction = 1;
+            reason = 'target-after-visible';
+        } else if (!lower && higher) {
+            direction = -1;
+            reason = 'target-before-visible';
+        } else if (lower && higher) {
+            const lowerDistance = index - lower.remoteIndex;
+            const higherDistance = higher.remoteIndex - index;
+            direction = higherDistance <= lowerDistance ? -1 : 1;
+            reason = direction < 0 ? 'between-closer-to-higher' : 'between-closer-to-lower';
+        }
+
+        return {
+            top: Math.max(0, Math.min(maxTop, currentTop + direction * step)),
+            currentTop,
+            direction,
+            reason,
+            visibleIndexes
+        };
+    }
+
+    function findMessageIndexByIdentityKeys(identityKeys) {
+        if (!identityKeys || !identityKeys.length) return -1;
+        for (let i = 0; i < STATE.messages.length; i++) {
+            const keys = getMessageIdentityKeys(STATE.messages[i]);
+            for (let j = 0; j < keys.length; j++) {
+                if (identityKeys.includes(keys[j])) return i;
+            }
+        }
+        return -1;
+    }
+
+    function waitForMilliseconds(delay) {
+        return new Promise((resolve) => window.setTimeout(resolve, delay));
+    }
+
+    function isVisibleElement(element) {
+        if (!(element instanceof HTMLElement)) return false;
+        if (!element.isConnected) return false;
+
+        const style = window.getComputedStyle(element);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    function isElementInViewport(element, container) {
+        if (!element || !element.getBoundingClientRect) return false;
+
+        const rect = element.getBoundingClientRect();
+        const viewport = getViewportRect(container);
+        return rect.bottom > viewport.top && rect.top < viewport.bottom;
+    }
+
+    function getClosestElementToViewportCenter(elements, container) {
+        const viewport = getViewportRect(container);
+        const center = viewport.top + viewport.height / 2;
+
+        return elements
+            .map((element) => {
+                const rect = element.getBoundingClientRect();
+                return {
+                    element,
+                    distance: Math.abs(rect.top + rect.height / 2 - center)
+                };
+            })
+            .sort((a, b) => a.distance - b.distance)[0]?.element || null;
+    }
+
+    function findChatGptNativeTocUserQueryCandidate(text, preferActive) {
+        const container = getActiveScrollContainer();
+        const users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+            .filter((element) => isVisibleElement(element) && isElementInViewport(element, container));
+        const matches = users.filter((element) => isCompatibleNativeTocText(normalizeMessageText(element), text));
+        if (!matches.length) return null;
+        if (preferActive || matches.length > 1) return getClosestElementToViewportCenter(matches, container);
+        return matches[0];
+    }
+
+    function resolveChatGptNativeTocEntryForMessage(message, index) {
+        if (!message || !window.location.hostname.includes('chatgpt.com')) return null;
+
+        const nativeIndex = typeof message.nativeTocIndex === 'number'
+            ? message.nativeTocIndex
+            : getMessageRemoteIndex(message, index);
+        let entry = getChatGptNativeTocEntryForIndex(nativeIndex);
+        if (entry) return entry;
+
+        return getChatGptNativeTocEntries().find((candidate) => (
+            isCompatibleNativeTocText(message.text, candidate.text)
+        )) || null;
+    }
+
+    async function waitForChatGptNativeTocUserQuery(entry, message, timeout) {
+        const endAt = Date.now() + timeout;
+        while (Date.now() < endAt) {
+            await waitForMilliseconds(80);
+            const activeIndex = getChatGptActiveNativeTocIndex();
+            const candidate = findChatGptNativeTocUserQueryCandidate(
+                message.text || entry.text,
+                activeIndex === entry.index
+            );
+            if (candidate) return candidate;
+        }
+        return null;
+    }
+
+    function attachResolvedUserElementToMessage(message, element, anchorSource) {
+        const domIdentityKey = getMessageIdentityKeyFromElement(element);
+        if (domIdentityKey) {
+            message.identityKeys = createMessageIdentityKeys.apply(
+                null,
+                getMessageIdentityKeys(message).concat([domIdentityKey])
+            );
+            message.identityKey = message.identityKeys[0] || message.identityKey;
+        }
+        message.anchor = element;
+        message.container = ADAPTER.resolveMessageContainer(element);
+        message.anchorSource = anchorSource;
+        return domIdentityKey;
+    }
+
+    async function navigateWithChatGptNativeToc(message, index) {
+        const entry = resolveChatGptNativeTocEntryForMessage(message, index);
+        if (!entry || !entry.button) return false;
+
+        const identityKeys = getMessageIdentityKeys(message);
+        if (entry.element && entry.element.isConnected) {
+            const domIdentityKey = attachResolvedUserElementToMessage(message, entry.element, 'native-toc-mounted');
+            STATE.lastNavigationDebug = {
+                mode: 'native-toc-mounted',
+                index,
+                remoteIndex: getMessageRemoteIndex(message, index),
+                nativeTocIndex: entry.index,
+                identityKeys,
+                domIdentityKey,
+                nativeText: entry.text,
+                targetText: normalizeMessageText(entry.element).slice(0, 80)
+            };
+            scrollExactUserElementIntoView(entry.element, index, 'auto');
+            return true;
+        }
+
+        STATE.lastNavigationDebug = {
+            mode: 'native-toc-start',
+            index,
+            remoteIndex: getMessageRemoteIndex(message, index),
+            nativeTocIndex: entry.index,
+            identityKeys,
+            nativeText: entry.text,
+            text: message.text.slice(0, 80)
+        };
+
+        try {
+            entry.button.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        } catch (error) {
+            // The button click still works when the horizontal prompt strip cannot scroll.
+        }
+        entry.button.click();
+
+        const target = await waitForChatGptNativeTocUserQuery(entry, message, 1800);
+        if (!target) {
+            const activeNativeTocIndex = getChatGptActiveNativeTocIndex();
+            STATE.lastNavigationDebug = {
+                mode: activeNativeTocIndex === entry.index ? 'native-toc-active-only' : 'native-toc-timeout',
+                index,
+                remoteIndex: getMessageRemoteIndex(message, index),
+                nativeTocIndex: entry.index,
+                identityKeys,
+                activeNativeTocIndex,
+                nativeText: entry.text,
+                text: message.text.slice(0, 80)
+            };
+            return activeNativeTocIndex === entry.index;
+        }
+
+        const domIdentityKey = attachResolvedUserElementToMessage(message, target, 'native-toc');
+        STATE.lastNavigationDebug = {
+            mode: 'native-toc-hit',
+            index,
+            remoteIndex: getMessageRemoteIndex(message, index),
+            nativeTocIndex: entry.index,
+            identityKeys,
+            activeNativeTocIndex: getChatGptActiveNativeTocIndex(),
+            domIdentityKey,
+            nativeText: entry.text,
+            targetText: normalizeMessageText(target).slice(0, 80)
+        };
+        scrollExactUserElementIntoView(target, index, 'auto');
+        scheduleActiveSync();
+        return true;
+    }
+
+    function scrollChatGptSlotForRevive(slot) {
+        if (!slot || !slot.isConnected) return false;
+
+        const container = findScrollContainerForElement(slot);
+        if (STATE.scrollContainer !== container) bindScrollSync();
+
+        const viewport = getViewportRect(container);
+        const slotTop = getElementAbsoluteTop(slot, container);
+        if (typeof slotTop === 'number') {
+            scrollTargetToInstant(container, slotTop - viewport.height * 0.45);
+        } else {
+            try {
+                slot.scrollIntoView({ block: 'center', behavior: 'instant' });
+            } catch (error) {
+                try {
+                    slot.scrollIntoView({ block: 'center' });
+                } catch (innerError) {
+                    return false;
+                }
+            }
+        }
+
+        pokeChatGptLazyMount(container, slot);
+        if (container && !isWindowScrollTarget(container)) {
+            container.dispatchEvent(new Event('scroll', { bubbles: true }));
+        }
+        window.dispatchEvent(new Event('resize'));
+        return true;
+    }
+
+    function resolveMountedChatGptRemoteTarget(message, index) {
+        const identityKeys = getMessageIdentityKeys(message);
+        const identityMatch = findLiveUserElementByIdentityKeys(identityKeys);
+        if (identityMatch) return { element: identityMatch, source: 'remote-id' };
+
+        const turnShell = getChatGptTurnShellByIdentityKeys(identityKeys);
+        const turnUser = getChatGptSlotRoleElement(turnShell, 'user');
+        if (turnUser) return { element: turnUser, source: 'remote-turn-id' };
+
+        const slotMatch = findLiveUserElementInSlot(message, index);
+        if (slotMatch) return slotMatch;
+
+        return null;
+    }
+
+    async function waitForMountedChatGptRemoteTarget(message, index, timeout) {
+        const endAt = Date.now() + timeout;
+        while (Date.now() < endAt) {
+            await waitForMilliseconds(60);
+            scanContent();
+            const nextIndex = findMessageIndexByIdentityKeys(getMessageIdentityKeys(message));
+            const nextMessage = nextIndex >= 0 ? STATE.messages[nextIndex] : message;
+            const target = resolveMountedChatGptRemoteTarget(nextMessage, nextIndex >= 0 ? nextIndex : index);
+            if (target) {
+                return {
+                    match: target,
+                    message: nextMessage,
+                    index: nextIndex >= 0 ? nextIndex : index
+                };
+            }
+        }
+        return null;
+    }
+
+    async function navigateWithChatGptRemoteToc(message, index) {
+        const identityKeys = getMessageIdentityKeys(message);
+        const remoteIndex = getMessageRemoteIndex(message, index);
+        let liveMatch = resolveMountedChatGptRemoteTarget(message, index);
+        if (liveMatch) {
+            const domIdentityKey = attachResolvedUserElementToMessage(message, liveMatch.element, liveMatch.source || 'remote-mounted');
+            STATE.lastNavigationDebug = {
+                mode: `remote-${liveMatch.source || 'mounted'}-hit`,
+                index,
+                remoteIndex,
+                identityKeys,
+                domIdentityKey,
+                targetText: normalizeMessageText(liveMatch.element).slice(0, 80),
+                slotText: liveMatch.slotText || ''
+            };
+            scrollExactUserElementIntoView(liveMatch.element, index, 'auto');
+            return true;
+        }
+
+        const slot = getChatGptTurnShellByIdentityKeys(identityKeys) || getChatGptUserSlotElement(remoteIndex);
+        if (!slot || !slot.isConnected) {
+            STATE.lastNavigationDebug = {
+                mode: 'remote-slot-missing',
+                index,
+                remoteIndex,
+                identityKeys,
+                hasConvRoot: !!getChatGptMessageSlotRoot(),
+                turnShells: getChatGptTurnShells().length,
+                text: message.text.slice(0, 80)
+            };
+            return false;
+        }
+
+        const slotDebug = getChatGptSlotDebug(slot);
+        const slotSource = getChatGptSlotSource(slot, remoteIndex);
+        STATE.lastNavigationDebug = {
+            mode: 'remote-slot-revive-start',
+            index,
+            remoteIndex,
+            childIndex: 1 + remoteIndex * 2,
+            slotSource,
+            identityKeys,
+            slotRole: slotDebug.role,
+            slotMessageId: slotDebug.messageId,
+            slotTurnId: slotDebug.turnId,
+            slotText: slotDebug.text,
+            slotHasLastKnownHeight: slotDebug.hasLastKnownHeight,
+            slotHeight: slotDebug.height,
+            text: message.text.slice(0, 80)
+        };
+        if (!scrollChatGptSlotForRevive(slot)) return false;
+
+        const resolved = await waitForMountedChatGptRemoteTarget(message, index, 2600);
+        if (!resolved) {
+            const latestSlot = getChatGptTurnShellByIdentityKeys(identityKeys) || getChatGptUserSlotElement(remoteIndex);
+            const latestSlotDebug = getChatGptSlotDebug(latestSlot);
+            STATE.lastNavigationDebug = {
+                mode: 'remote-slot-timeout',
+                index,
+                remoteIndex,
+                childIndex: 1 + remoteIndex * 2,
+                slotSource: getChatGptSlotSource(latestSlot, remoteIndex),
+                identityKeys,
+                slotRole: latestSlotDebug.role,
+                slotMessageId: latestSlotDebug.messageId,
+                slotTurnId: latestSlotDebug.turnId,
+                slotText: latestSlotDebug.text,
+                slotHasLastKnownHeight: latestSlotDebug.hasLastKnownHeight,
+                slotHeight: latestSlotDebug.height,
+                text: message.text.slice(0, 80)
+            };
+            return false;
+        }
+
+        liveMatch = resolved.match;
+        const resolvedMessage = resolved.message;
+        const resolvedIndex = resolved.index;
+        const domIdentityKey = attachResolvedUserElementToMessage(
+            resolvedMessage,
+            liveMatch.element,
+            liveMatch.source || 'remote-revived'
+        );
+        STATE.clickLockIndex = resolvedIndex;
+        setActiveIndex(resolvedIndex);
+        STATE.lastNavigationDebug = {
+            mode: `remote-${liveMatch.source || 'revived'}-hit`,
+            index: resolvedIndex,
+            requestedIndex: index,
+            remoteIndex: getMessageRemoteIndex(resolvedMessage, resolvedIndex),
+            identityKeys,
+            domIdentityKey,
+            targetText: normalizeMessageText(liveMatch.element).slice(0, 80),
+            slotText: liveMatch.slotText || ''
+        };
+        scrollExactUserElementIntoView(liveMatch.element, resolvedIndex, 'auto');
+        scheduleActiveSync();
+        return true;
+    }
+
+    function seekVirtualMessageIntoView(identityKeys, attemptsLeft) {
+        clearVirtualSeekTimer();
+        if (!identityKeys || !identityKeys.length || attemptsLeft <= 0) return;
+
+        STATE.virtualSeekTimer = window.setTimeout(() => {
+            STATE.virtualSeekTimer = 0;
+            scanContent();
+
+            const index = findMessageIndexByIdentityKeys(identityKeys);
+            const message = index >= 0 ? STATE.messages[index] : null;
+            if (!message) return;
+
+            const liveMatch = findLiveUserElementForMessage(message, index);
+            if (liveMatch) {
+                STATE.clickLockIndex = index;
+                setActiveIndex(index);
+                message.anchor = liveMatch.element;
+                message.container = ADAPTER.resolveMessageContainer(liveMatch.element);
+                STATE.lastNavigationDebug = {
+                    mode: liveMatch.source === 'id' ? 'virtual-id-hit' : `virtual-${liveMatch.source}-hit`,
+                    index,
+                    attemptsLeft,
+                    identityKeys,
+                    anchorSource: liveMatch.source,
+                    liveIndex: typeof liveMatch.liveIndex === 'number' ? liveMatch.liveIndex : null,
+                    domIdentityKey: liveMatch.domIdentityKey || '',
+                    targetText: normalizeMessageText(liveMatch.element).slice(0, 80),
+                    slotText: liveMatch.slotText || ''
+                };
+                scrollExactUserElementIntoView(liveMatch.element, index, 'auto');
+                scheduleActiveSync();
+                return;
+            }
+
+            const remoteIndex = getMessageRemoteIndex(message, index);
+            const slot = getChatGptUserSlotElement(remoteIndex);
+            if (slot && slot.isConnected) {
+                const shouldNudgeSlot = String(slot.className || '').includes('last-known-height') &&
+                    attemptsLeft > 0 &&
+                    attemptsLeft % 5 === 0;
+                if (shouldNudgeSlot) {
+                    scrollChatGptUserSlotIntoView(remoteIndex, index, 'auto');
+                } else {
+                    pokeChatGptLazyMount(findScrollContainerForElement(slot), slot);
+                }
+                const slotDebug = getChatGptSlotDebug(slot);
+                STATE.lastNavigationDebug = {
+                    mode: shouldNudgeSlot ? 'slot-nudge' : 'slot-wait',
+                    index,
+                    remoteIndex,
+                    childIndex: 1 + remoteIndex * 2,
+                    attemptsLeft,
+                    identityKeys,
+                    slotRole: slotDebug.role,
+                    slotMessageId: slotDebug.messageId,
+                    slotText: slotDebug.text,
+                    slotHasLastKnownHeight: slotDebug.hasLastKnownHeight,
+                    slotHeight: slotDebug.height,
+                    lazyMountPoked: true
+                };
+            } else {
+                const container = getActiveScrollContainer();
+                const seek = getDirectionalSeekScroll(index, container);
+                STATE.lastNavigationDebug = {
+                    mode: 'virtual-seek-step-fallback',
+                    index,
+                    attemptsLeft,
+                    identityKeys,
+                    nextTop: Math.round(seek.top),
+                    currentTop: Math.round(seek.currentTop),
+                    direction: seek.direction,
+                    reason: seek.reason,
+                    visibleRemoteIndexes: seek.visibleIndexes
+                };
+                scrollTargetTo(container, seek.top, 'auto');
+            }
+            scheduleActiveSync();
+            seekVirtualMessageIntoView(identityKeys, attemptsLeft - 1);
+        }, TIMINGS.virtualSeekInterval);
+    }
+
+    function scrollVirtualMessageIntoView(message, index) {
+        const identityKeys = getMessageIdentityKeys(message);
+        if (!identityKeys.length) return;
+
+        clearVirtualSeekTimer();
+
+        const liveMatch = findLiveUserElementForMessage(message, index);
+        if (liveMatch) {
+            STATE.lastNavigationDebug = {
+                mode: liveMatch.source === 'id' ? 'already-mounted-id-hit' : `already-mounted-${liveMatch.source}-hit`,
+                index,
+                identityKeys,
+                anchorSource: liveMatch.source,
+                liveIndex: typeof liveMatch.liveIndex === 'number' ? liveMatch.liveIndex : null,
+                domIdentityKey: liveMatch.domIdentityKey || '',
+                targetText: normalizeMessageText(liveMatch.element).slice(0, 80),
+                slotText: liveMatch.slotText || ''
+            };
+            scrollExactUserElementIntoView(liveMatch.element, index, 'auto');
+            return;
+        }
+
+        const remoteIndex = getMessageRemoteIndex(message, index);
+        if (!scrollChatGptUserSlotIntoView(remoteIndex, index, 'auto')) {
+            const container = getActiveScrollContainer();
+            const seek = getDirectionalSeekScroll(index, container);
+            STATE.lastNavigationDebug = {
+                mode: 'virtual-seek-start-fallback',
+                index,
+                identityKeys,
+                nextTop: Math.round(seek.top),
+                currentTop: Math.round(seek.currentTop),
+                direction: seek.direction,
+                reason: seek.reason,
+                visibleRemoteIndexes: seek.visibleIndexes,
+                text: message.text.slice(0, 80)
+            };
+            scrollTargetTo(container, seek.top, 'auto');
+        } else {
+            STATE.lastNavigationDebug.identityKeys = identityKeys;
+            STATE.lastNavigationDebug.text = message.text.slice(0, 80);
+        }
+        seekVirtualMessageIntoView(identityKeys, TIMINGS.virtualSeekMaxAttempts);
     }
 
     function holdManualActiveIndex(index, duration) {
@@ -1121,6 +2876,7 @@
         STATE.clickLockIndex = -1;
         clearManualActiveIndex();
         clearJumpSyncTimer();
+        clearVirtualSeekTimer();
     }
 
     function beginForcedBoundaryNavigation(index) {
@@ -1234,6 +2990,10 @@
         STATE.tocUserScrollUntil = Date.now() + (typeof duration === 'number' ? duration : TIMINGS.tocFollowPause);
     }
 
+    function pauseTocFollowForNavigation() {
+        markTocUserScroll(5000);
+    }
+
     function shouldPauseTocFollow() {
         return Date.now() < STATE.tocUserScrollUntil;
     }
@@ -1307,6 +3067,16 @@
 
     function findActiveMessageIndex(messages) {
         if (!messages.length) return -1;
+
+        if (ADAPTER.id === 'chatgpt') {
+            const nativeActiveIndex = getChatGptActiveNativeTocIndex();
+            if (nativeActiveIndex !== null) {
+                const messageIndex = messages.findIndex((message, index) => (
+                    (typeof message.nativeTocIndex === 'number' ? message.nativeTocIndex : index) === nativeActiveIndex
+                ));
+                if (messageIndex >= 0) return messageIndex;
+            }
+        }
 
         const container = getActiveScrollContainer();
         if (STATE.positionsDirty || STATE.positionCache.length !== messages.length) {
@@ -1499,7 +3269,7 @@
         }
     }
 
-    function handleTocItemClick(event, list) {
+    async function handleTocItemClick(event, list) {
         const item = event.target.closest('.toc-item');
         if (!item || !list.contains(item)) return;
 
@@ -1507,16 +3277,73 @@
         const msg = STATE.messages[index];
         if (!msg) return;
 
-        if (isMessageConnected(msg)) {
-            notePanelActivity();
-            STATE.clickLockIndex = index;
-            setActiveIndex(index);
-            holdManualActiveIndex(index);
-            scrollMessageIntoView(msg, index);
+        const clickedText = (item.querySelector('.toc-text') ? item.querySelector('.toc-text').textContent : item.textContent || '').trim();
+        STATE.lastTocClick = {
+            index,
+            clickedText,
+            messageText: msg.text,
+            remoteIndex: getMessageRemoteIndex(msg, index),
+            nativeTocIndex: typeof msg.nativeTocIndex === 'number' ? msg.nativeTocIndex : null,
+            nativeTocText: msg.nativeTocText || '',
+            identityKeys: getMessageIdentityKeys(msg)
+        };
+
+        notePanelActivity();
+        pauseTocFollowForNavigation();
+        STATE.clickLockIndex = index;
+        setActiveIndex(index);
+
+        if (ADAPTER.id === 'chatgpt') {
+            clearManualActiveIndex();
+            const nativeHandled = await navigateWithChatGptNativeToc(msg, index);
+            if (nativeHandled) return;
+
+            const remoteHandled = await navigateWithChatGptRemoteToc(msg, index);
+            if (remoteHandled) return;
+
+            if (!nativeHandled && !(STATE.lastNavigationDebug && /^remote-/.test(STATE.lastNavigationDebug.mode || ''))) {
+                STATE.lastNavigationDebug = {
+                    mode: 'chatgpt-navigation-unavailable',
+                    index,
+                    remoteIndex: getMessageRemoteIndex(msg, index),
+                    nativeTocIndex: typeof msg.nativeTocIndex === 'number' ? msg.nativeTocIndex : null,
+                    nativeTocMessages: getChatGptNativeTocEntries().length,
+                    remoteMessages: STATE.remoteMessages.length,
+                    text: msg.text.slice(0, 80)
+                };
+            }
             return;
         }
 
-        triggerBottomBoundaryNavigation();
+        holdManualActiveIndex(index, TIMINGS.virtualSeekInterval * TIMINGS.virtualSeekMaxAttempts);
+
+        if (isMessageConnected(msg)) {
+            holdManualActiveIndex(index);
+            const liveMatch = findLiveUserElementForMessage(msg, index);
+            if (liveMatch) {
+                STATE.lastNavigationDebug = {
+                    mode: liveMatch.source === 'id' ? 'connected-id-hit' : `connected-${liveMatch.source}-hit`,
+                    index,
+                    identityKeys: getMessageIdentityKeys(msg),
+                    anchorSource: liveMatch.source,
+                    liveIndex: typeof liveMatch.liveIndex === 'number' ? liveMatch.liveIndex : null,
+                    domIdentityKey: liveMatch.domIdentityKey || '',
+                    targetText: normalizeMessageText(liveMatch.element).slice(0, 80)
+                };
+                scrollExactUserElementIntoView(liveMatch.element, index, 'auto');
+            } else {
+                STATE.lastNavigationDebug = {
+                    mode: 'connected-fallback',
+                    index,
+                    identityKeys: getMessageIdentityKeys(msg),
+                    text: msg.text.slice(0, 80)
+                };
+                scrollMessageIntoView(msg, index);
+            }
+            return;
+        }
+
+        scrollVirtualMessageIntoView(msg, index);
     }
 
     function bindTocListInteractions(list) {
@@ -1893,6 +3720,7 @@
 
     function collectCurrentMessages() {
         const messages = collectMessagesFromAdapter(ADAPTER);
+        annotateMessagesWithNativeToc(messages);
         STATE.messages = messages;
         return messages;
     }
@@ -1957,6 +3785,8 @@
     }
 
     function bootstrap() {
+        installChatGptConversationInterceptors();
+        exposeDebugInfo();
         ensureAppRunning();
         if (getPanelElement()) {
             scheduleScan(0);
