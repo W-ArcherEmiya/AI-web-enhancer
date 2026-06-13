@@ -88,6 +88,8 @@ stress-test.html
 
 ## 反馈
 
+如果这个脚本对你有帮助，欢迎在 GitHub 点一个 Star。
+
 如发现 Bug 或希望增加功能，欢迎提交 Issue 或 PR：
 
 - GitHub: https://github.com/W-ArcherEmiya/AI-web-enhancer
