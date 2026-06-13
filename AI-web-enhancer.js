@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 目录插件 (Gemini & ChatGPT & Claude)
 // @namespace    http://tampermonkey.net/
-// @version      2.8.0
+// @version      2.8.1
 // @description  生成高效的 Gemini、ChatGPT 与 Claude 对话目录索引窗口。
 // @author       ArcherEmiya
 // @match        https://gemini.google.com/*
@@ -37,7 +37,7 @@
     }
 
     cleanUpOldVersions();
-    console.log('AI TOC Plugin v2.8.0: started');
+    console.log('AI TOC Plugin v2.8.1: started');
 
     function getPageWindow() {
         try {
@@ -96,6 +96,8 @@
         remoteFetchInFlight: false,
         remoteFetchStatus: '',
         conversationInterceptorInstalled: false,
+        lastTocSource: '',
+        messageListContext: '',
         lastTocClick: null,
         lastNavigationDebug: null,
         virtualSeekTimer: 0,
@@ -590,8 +592,14 @@
             return false;
         }
 
+        const context = contextOverride || getChatGptMessageCacheContext();
+        if (STATE.remoteMessageContext === context && STATE.remoteMessages.length > messages.length) {
+            STATE.remoteFetchStatus = `${source}:ignored-short:${messages.length}<${STATE.remoteMessages.length}`;
+            return false;
+        }
+
         STATE.remoteMessages = messages;
-        STATE.remoteMessageContext = contextOverride || getChatGptMessageCacheContext();
+        STATE.remoteMessageContext = context;
         STATE.remoteMessageSource = source;
         STATE.remoteFetchStatus = `${source}:ok:${messages.length}`;
         scheduleScan(0);
@@ -888,7 +896,7 @@
             }));
 
             return {
-                version: '2.8.0',
+                version: '2.8.1',
                 conversationId: getChatGptConversationId(),
                 url: window.location.href,
                 adapterId: ADAPTER.id,
@@ -903,6 +911,7 @@
                 remoteFetchContext: STATE.remoteFetchContext,
                 remoteFetchInFlight: STATE.remoteFetchInFlight,
                 remoteFetchStatus: STATE.remoteFetchStatus,
+                tocSource: STATE.lastTocSource,
                 interceptorInstalled: STATE.conversationInterceptorInstalled,
                 exactTextOrderAnchors: STATE.messages.filter((message) => message.anchorSource === 'exact-text-order').length,
                 containedTextOrderAnchors: STATE.messages.filter((message) => message.anchorSource === 'contained-text-order').length,
@@ -924,9 +933,9 @@
             };
         };
         window.__aiTocDebug = debugFn;
-        window.__aiTocVersion = '2.8.0';
+        window.__aiTocVersion = '2.8.1';
         pageWindow.__aiTocDebug = debugFn;
-        pageWindow.__aiTocVersion = '2.8.0';
+        pageWindow.__aiTocVersion = '2.8.1';
     }
 
     function collectMessagesFromAdapter(adapter) {
@@ -1040,16 +1049,6 @@
                 return window.location.hostname.includes('chatgpt.com');
             },
             beforeCollect() {
-                const nativeTocMessages = getChatGptNativeTocEntries();
-                if (nativeTocMessages.length) {
-                    STATE.remoteMessages = [];
-                    STATE.remoteMessageContext = 'disabled:native-toc';
-                    STATE.remoteMessageSource = '';
-                    STATE.remoteFetchContext = '';
-                    STATE.remoteFetchStatus = 'disabled:native-toc';
-                    return;
-                }
-
                 const context = getChatGptMessageCacheContext();
                 if (STATE.remoteMessageContext && STATE.remoteMessageContext !== context) {
                     STATE.remoteMessages = [];
@@ -1076,10 +1075,30 @@
             },
             mergeMessages(liveMessages) {
                 const nativeTocMessages = collectChatGptNativeTocMessages();
-                if (nativeTocMessages.length) return nativeTocMessages;
+                const fallbackMessages = nativeTocMessages.length > liveMessages.length
+                    ? nativeTocMessages
+                    : liveMessages;
                 const context = getChatGptMessageCacheContext();
-                if (STATE.remoteMessageContext !== context) return liveMessages;
-                return mergeRemoteAndLiveMessages(STATE.remoteMessages, liveMessages);
+                if (STATE.remoteMessageContext === context && STATE.remoteMessages.length) {
+                    const mergedMessages = mergeRemoteAndLiveMessages(STATE.remoteMessages, liveMessages);
+                    if (fallbackMessages.length > mergedMessages.length) {
+                        STATE.lastTocSource = nativeTocMessages.length > liveMessages.length
+                            ? 'native-toc-larger-than-remote'
+                            : 'live-dom-larger-than-remote';
+                        return fallbackMessages;
+                    }
+
+                    STATE.lastTocSource = `remote:${STATE.remoteMessageSource || 'conversation'}`;
+                    return mergedMessages;
+                }
+
+                if (fallbackMessages === nativeTocMessages) {
+                    STATE.lastTocSource = 'native-toc-fallback';
+                    return nativeTocMessages;
+                }
+
+                STATE.lastTocSource = 'live-dom-fallback';
+                return liveMessages;
             }
         },
         gemini: {
@@ -1929,8 +1948,13 @@
         if (!target || !target.isConnected) return;
         const viewport = getViewportRect(container);
         const rect = target.getBoundingClientRect();
-        const offset = Math.min(24, viewport.height * 0.06);
+        const offset = Math.min(120, Math.max(72, viewport.height * 0.12));
         return Math.max(0, Math.min(getScrollTop(container) + rect.top - viewport.top - offset, getScrollMaxTop(container)));
+    }
+
+    function getExactUserViewportTop(container) {
+        const viewport = getViewportRect(container);
+        return viewport.top + Math.min(120, Math.max(72, viewport.height * 0.12));
     }
 
     function isExactUserTarget(target) {
@@ -2003,6 +2027,16 @@
             const currentTop = getScrollTop(currentContainer);
             if (Math.abs(currentTop - exactTop) > 4) {
                 scrollTargetTo(currentContainer, exactTop, 'auto');
+            }
+
+            if (STATE.lastNavigationDebug && typeof STATE.lastNavigationDebug === 'object') {
+                const rect = target.getBoundingClientRect();
+                STATE.lastNavigationDebug.targetViewportTop = Math.round(getExactUserViewportTop(currentContainer));
+                STATE.lastNavigationDebug.finalRect = {
+                    top: Math.round(rect.top),
+                    bottom: Math.round(rect.bottom),
+                    height: Math.round(rect.height)
+                };
             }
 
             scheduleActiveSync();
@@ -2078,8 +2112,10 @@
         } else {
             scrollTargetToInstant(container, exactTop);
         }
+        scheduleJumpCorrection(element, 4, index);
         const rect = element.getBoundingClientRect();
         if (STATE.lastNavigationDebug && typeof STATE.lastNavigationDebug === 'object') {
+            STATE.lastNavigationDebug.targetViewportTop = Math.round(getExactUserViewportTop(container));
             STATE.lastNavigationDebug.finalRect = {
                 top: Math.round(rect.top),
                 bottom: Math.round(rect.bottom),
@@ -2624,7 +2660,7 @@
                 nativeText: entry.text,
                 text: message.text.slice(0, 80)
             };
-            return activeNativeTocIndex === entry.index;
+            return false;
         }
 
         const domIdentityKey = attachResolvedUserElementToMessage(message, target, 'native-toc');
@@ -3793,7 +3829,17 @@
     }
 
     function collectCurrentMessages() {
-        const messages = collectMessagesFromAdapter(ADAPTER);
+        let messages = collectMessagesFromAdapter(ADAPTER);
+        if (ADAPTER.id === 'chatgpt') {
+            const context = getChatGptMessageCacheContext();
+            if (STATE.messageListContext !== context) {
+                STATE.messageListContext = context;
+                STATE.messages = [];
+            } else if (STATE.messages.length > messages.length) {
+                messages = mergeRemoteAndLiveMessages(STATE.messages, messages);
+                STATE.lastTocSource = `${STATE.lastTocSource || 'scan'}+stable-snapshot`;
+            }
+        }
         annotateMessagesWithNativeToc(messages);
         STATE.messages = messages;
         return messages;
