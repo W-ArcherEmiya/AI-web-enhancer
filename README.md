@@ -1,10 +1,7 @@
 # ai-chat-outline
 
-project description
 
 ▎ Adds a sidebar table of contents to ChatGPT, Gemini and Claude. Jump to any previous prompt in long conversations, filter by keyword, and return to top or bottom instantly. Auto-highlights your current position. Optimized for very long chats.
-
-项目描述
 
 ▎ 为 ChatGPT、Gemini、Claude 网页版生成侧边目录，长对话中可快速跳转到任意历史提问，支持关键词过滤、一键回顶/到底，并自动高亮当前阅读位置。针对超长对话做了性能优化。
 
@@ -58,7 +55,7 @@ project description
 
 然后通过 Greasy Fork 安装脚本：
 
-[安装 ai-chat-outline](https://greasyfork.org/zh-CN/scripts/563498-AI-%E7%9B%AE%E5%BD%95%E6%8F%92%E4%BB%B6-v2-0)
+[安装 ai-chat-outline](https://greasyfork.org/zh-CN/scripts/563498-ai-chat-outline)
 
 ## 使用方式
 
