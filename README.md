@@ -1,6 +1,12 @@
-# AI Web Enhancer
+# ai-chat-outline
 
-面向 ChatGPT、Gemini 与 Claude 网页版的 Tampermonkey 用户脚本，用于生成侧边目录，提升长对话场景下的浏览、定位与回看效率。
+英文
+
+▎ Adds a sidebar table of contents to ChatGPT, Gemini and Claude. Jump to any previous prompt in long conversations, filter by keyword, and return to top or bottom instantly. Auto-highlights your current position. Optimized for very long chats.
+
+中文
+
+▎ 为 ChatGPT、Gemini、Claude 网页版生成侧边目录，长对话中可快速跳转到任意历史提问，支持关键词过滤、一键回顶/到底，并自动高亮当前阅读位置。针对超长对话做了性能优化。
 
 ## 面板: 
 ![demo](https://raw.githubusercontent.com/W-ArcherEmiya/Images/main/ai_web_enhancer/scrennshoot_board.png)
@@ -22,17 +28,16 @@
 
 ## 最新版本
 
+### v2.8.2
+
+- 项目更名为 `ai-chat-outline`，同步更新 README、脚本元信息、测试页引用和核心脚本文件名。
+- README 顶部描述更新为中英文双语说明，突出长对话目录、关键词过滤、回顶/到底和当前位置高亮能力。
+
 ### v2.8.1
 
 - 修复 ChatGPT 原生目录分段挂载时覆盖完整会话数据，导致目录条目缺失的问题。
 - 完整会话数据作为目录主数据源，原生目录仅用于补充真实跳转锚点。
 - 修复部分条目跳转后用户问题贴近页面顶部并被悬浮区域遮挡的问题。
-
-### v2.8.0
-
-- 新增 Claude Web 基础支持，可为 Claude 对话生成侧边目录并点击跳转。
-- Claude 页面使用 `Cl` 气泡标签，保持与 ChatGPT、Gemini 一致的目录交互。
-- 继续保留 ChatGPT 长对话完整目录和精确跳转能力。
 
 ## 适用平台
 
@@ -53,7 +58,7 @@
 
 然后通过 Greasy Fork 安装脚本：
 
-[安装 AI 目录插件](https://greasyfork.org/zh-CN/scripts/563498-AI-%E7%9B%AE%E5%BD%95%E6%8F%92%E4%BB%B6-v2-0)
+[安装 ai-chat-outline](https://greasyfork.org/zh-CN/scripts/563498-AI-%E7%9B%AE%E5%BD%95%E6%8F%92%E4%BB%B6-v2-0)
 
 ## 使用方式
 
@@ -69,13 +74,13 @@
 克隆仓库：
 
 ```bash
-git clone https://github.com/W-ArcherEmiya/AI-web-enhancer.git
+git clone https://github.com/W-ArcherEmiya/ai-chat-outline.git
 ```
 
 核心脚本文件：
 
 ```text
-AI-web-enhancer.js
+ai-chat-outline.js
 ```
 
 本地性能回归页：
@@ -92,7 +97,7 @@ stress-test.html
 
 如发现 Bug 或希望增加功能，欢迎提交 Issue 或 PR：
 
-- GitHub: https://github.com/W-ArcherEmiya/AI-web-enhancer
+- GitHub: https://github.com/W-ArcherEmiya/ai-chat-outline
 
 ## License
 

@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AI 目录插件 (Gemini & ChatGPT & Claude)
+// @name         ai-chat-outline
 // @namespace    http://tampermonkey.net/
-// @version      2.8.1
-// @description  生成高效的 Gemini、ChatGPT 与 Claude 对话目录索引窗口。
+// @version      2.8.2
+// @description  Adds a sidebar table of contents to ChatGPT, Gemini and Claude.
 // @author       ArcherEmiya
 // @match        https://gemini.google.com/*
 // @match        https://chatgpt.com/*
@@ -37,7 +37,7 @@
     }
 
     cleanUpOldVersions();
-    console.log('AI TOC Plugin v2.8.1: started');
+    console.log('ai-chat-outline v2.8.2: started');
 
     function getPageWindow() {
         try {
@@ -896,7 +896,7 @@
             }));
 
             return {
-                version: '2.8.1',
+                version: '2.8.2',
                 conversationId: getChatGptConversationId(),
                 url: window.location.href,
                 adapterId: ADAPTER.id,
@@ -933,9 +933,9 @@
             };
         };
         window.__aiTocDebug = debugFn;
-        window.__aiTocVersion = '2.8.1';
+        window.__aiTocVersion = '2.8.2';
         pageWindow.__aiTocDebug = debugFn;
-        pageWindow.__aiTocVersion = '2.8.1';
+        pageWindow.__aiTocVersion = '2.8.2';
     }
 
     function collectMessagesFromAdapter(adapter) {
