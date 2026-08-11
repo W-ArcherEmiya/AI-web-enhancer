@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ai-chat-outline
 // @namespace    http://tampermonkey.net/
-// @version      2.8.2
+// @version      2.8.3
 // @description  Adds a sidebar table of contents to ChatGPT, Gemini and Claude.
 // @author       ArcherEmiya
 // @match        https://gemini.google.com/*
@@ -37,7 +37,7 @@
     }
 
     cleanUpOldVersions();
-    console.log('ai-chat-outline v2.8.2: started');
+    console.log('ai-chat-outline v2.8.3: started');
 
     function getPageWindow() {
         try {
@@ -89,6 +89,8 @@
         autoCollapseTimer: 0,
         positionCache: [],
         positionsDirty: true,
+        stableMessages: [],
+        stableMessageContext: '',
         remoteMessages: [],
         remoteMessageContext: '',
         remoteMessageSource: '',
@@ -109,7 +111,8 @@
         panelPosition: 'ai-toc-v2_5-panel-position',
         expandedPosition: 'ai-toc-v2_5-expanded-position',
         bubblePosition: 'ai-toc-v2_5-bubble-position',
-        collapsed: 'ai-toc-v2_5-collapsed'
+        collapsed: 'ai-toc-v2_5-collapsed',
+        stableMessagesPrefix: 'ai-toc-v2_8_3-stable-messages'
     };
 
     const PATHS = {
@@ -764,6 +767,229 @@
         return merged;
     }
 
+    function getStableMessageKeys(message) {
+        if (!message) return [];
+
+        const keys = [];
+        getMessageIdentityKeys(message).forEach((key) => keys.push(key));
+
+        if (typeof message.remoteIndex === 'number') {
+            keys.push(`remote:${message.remoteIndex}`);
+        }
+        if (typeof message.nativeTocIndex === 'number') {
+            keys.push(`native:${message.nativeTocIndex}`);
+        }
+        if (message.navigationId) {
+            keys.push(`navigation:${message.navigationId}`);
+        }
+
+        const comparable = getComparableMessageText(message.text);
+        if (comparable) {
+            keys.push(`text:${comparable.slice(0, 240)}`);
+        }
+
+        return Array.from(new Set(keys));
+    }
+
+    function getObservedMessageTop(message) {
+        if (message && typeof message.observedTop === 'number') return message.observedTop;
+
+        const target = getMessageTarget(message);
+        if (!target || !target.isConnected) return;
+
+        const container = findScrollContainerForElement(target);
+        return getMessageAbsoluteTop(message, container);
+    }
+
+    function snapshotMessageForStableCache(message, fallbackIndex) {
+        const target = getMessageTarget(message);
+        const targetConnected = !!(target && target.isConnected);
+        const anchorConnected = !!(message && message.anchor && message.anchor.isConnected);
+        const containerConnected = !!(message && message.container && message.container.isConnected);
+        const identityKeys = getMessageIdentityKeys(message);
+        const observedTop = getObservedMessageTop(message);
+        const snapshot = {
+            container: containerConnected ? message.container : (targetConnected ? target : null),
+            anchor: anchorConnected ? message.anchor : (targetConnected ? target : null),
+            text: message && message.text ? message.text : '',
+            identityKey: identityKeys[0] || '',
+            identityKeys,
+            navigationId: message && message.navigationId ? message.navigationId : '',
+            nativeTocText: message && message.nativeTocText ? message.nativeTocText : '',
+            source: message && message.source ? message.source : '',
+            anchorSource: message && message.anchorSource ? message.anchorSource : '',
+            observedIndex: message && typeof message.observedIndex === 'number' ? message.observedIndex : fallbackIndex
+        };
+
+        if (message && typeof message.remoteIndex === 'number') {
+            snapshot.remoteIndex = message.remoteIndex;
+        }
+        if (message && typeof message.nativeTocIndex === 'number') {
+            snapshot.nativeTocIndex = message.nativeTocIndex;
+        }
+        if (typeof observedTop === 'number') {
+            snapshot.observedTop = observedTop;
+        }
+
+        return snapshot;
+    }
+
+    function serializeStableMessage(message, index) {
+        const snapshot = snapshotMessageForStableCache(message, index);
+        const serialized = {
+            text: snapshot.text,
+            identityKey: snapshot.identityKey,
+            identityKeys: snapshot.identityKeys,
+            navigationId: snapshot.navigationId,
+            nativeTocText: snapshot.nativeTocText,
+            source: snapshot.source,
+            anchorSource: snapshot.anchorSource,
+            observedIndex: typeof snapshot.observedIndex === 'number' ? snapshot.observedIndex : index
+        };
+
+        if (typeof snapshot.remoteIndex === 'number') serialized.remoteIndex = snapshot.remoteIndex;
+        if (typeof snapshot.nativeTocIndex === 'number') serialized.nativeTocIndex = snapshot.nativeTocIndex;
+        if (typeof snapshot.observedTop === 'number') serialized.observedTop = snapshot.observedTop;
+        return serialized;
+    }
+
+    function getStableMessageStorageKey(context) {
+        if (!context) return '';
+        return `${STORAGE_KEYS.stableMessagesPrefix}:${context}`;
+    }
+
+    function readStoredStableMessages(context) {
+        const key = getStableMessageStorageKey(context);
+        if (!key) return [];
+
+        const raw = readStorageValue(key);
+        if (!raw) return [];
+
+        try {
+            const parsed = JSON.parse(raw);
+            const messages = Array.isArray(parsed) ? parsed : parsed.messages;
+            if (!Array.isArray(messages)) return [];
+
+            return messages
+                .filter((message) => message && typeof message.text === 'string' && message.text.trim())
+                .map((message, index) => ({
+                    container: null,
+                    anchor: null,
+                    text: message.text,
+                    identityKey: message.identityKey || '',
+                    identityKeys: Array.isArray(message.identityKeys) ? message.identityKeys : createMessageIdentityKeys(message.identityKey),
+                    navigationId: message.navigationId || '',
+                    nativeTocText: message.nativeTocText || '',
+                    source: message.source || 'stable-cache',
+                    anchorSource: message.anchorSource || '',
+                    remoteIndex: typeof message.remoteIndex === 'number' ? message.remoteIndex : undefined,
+                    nativeTocIndex: typeof message.nativeTocIndex === 'number' ? message.nativeTocIndex : undefined,
+                    observedTop: typeof message.observedTop === 'number' ? message.observedTop : undefined,
+                    observedIndex: typeof message.observedIndex === 'number' ? message.observedIndex : index
+                }));
+        } catch (error) {
+            return [];
+        }
+    }
+
+    function writeStoredStableMessages(context, messages) {
+        const key = getStableMessageStorageKey(context);
+        if (!key || !messages.length) return;
+
+        const payload = {
+            version: 1,
+            updatedAt: Date.now(),
+            messages: messages.slice(0, 400).map(serializeStableMessage)
+        };
+        writeStorageValue(key, JSON.stringify(payload));
+    }
+
+    function mergeStableMessage(existing, incoming) {
+        if (!existing) return incoming;
+
+        if (incoming.text && (!existing.text || incoming.text.length >= existing.text.length)) {
+            existing.text = incoming.text;
+        }
+
+        if (incoming.anchor && incoming.anchor.isConnected) existing.anchor = incoming.anchor;
+        if (incoming.container && incoming.container.isConnected) existing.container = incoming.container;
+        if (incoming.navigationId) existing.navigationId = incoming.navigationId;
+        if (incoming.nativeTocText) existing.nativeTocText = incoming.nativeTocText;
+        if (incoming.source) existing.source = incoming.source;
+        if (incoming.anchorSource) existing.anchorSource = incoming.anchorSource;
+        if (typeof incoming.remoteIndex === 'number') existing.remoteIndex = incoming.remoteIndex;
+        if (typeof incoming.nativeTocIndex === 'number') existing.nativeTocIndex = incoming.nativeTocIndex;
+        if (typeof incoming.observedTop === 'number') existing.observedTop = incoming.observedTop;
+        if (typeof incoming.observedIndex === 'number') {
+            existing.observedIndex = typeof existing.observedIndex === 'number'
+                ? Math.min(existing.observedIndex, incoming.observedIndex)
+                : incoming.observedIndex;
+        }
+
+        existing.identityKeys = createMessageIdentityKeys.apply(
+            null,
+            getMessageIdentityKeys(existing).concat(getMessageIdentityKeys(incoming))
+        );
+        existing.identityKey = existing.identityKeys[0] || existing.identityKey || incoming.identityKey || '';
+        return existing;
+    }
+
+    function getStableMessageSortValue(message) {
+        if (message && typeof message.remoteIndex === 'number') return message.remoteIndex * 1000000;
+        if (message && typeof message.nativeTocIndex === 'number') return message.nativeTocIndex * 1000000 + 1000;
+        if (message && typeof message.observedTop === 'number') return message.observedTop;
+        if (message && typeof message.observedIndex === 'number') return message.observedIndex * 1000000 + 500000;
+        return Number.MAX_SAFE_INTEGER;
+    }
+
+    function mergeChatGptStableMessages(currentMessages) {
+        const context = getChatGptMessageCacheContext();
+        if (STATE.stableMessageContext !== context) {
+            STATE.stableMessageContext = context;
+            STATE.stableMessages = readStoredStableMessages(context);
+        }
+
+        const merged = [];
+        const byKey = new Map();
+        const addMessage = (message, index) => {
+            const snapshot = snapshotMessageForStableCache(message, index);
+            if (!snapshot.text) return;
+
+            const keys = getStableMessageKeys(snapshot);
+            let existing = null;
+            for (let i = 0; i < keys.length; i++) {
+                existing = byKey.get(keys[i]);
+                if (existing) break;
+            }
+
+            if (!existing) {
+                existing = snapshot;
+                merged.push(existing);
+            } else {
+                mergeStableMessage(existing, snapshot);
+            }
+
+            getStableMessageKeys(existing).forEach((key) => byKey.set(key, existing));
+        };
+
+        STATE.stableMessages.forEach(addMessage);
+        currentMessages.forEach(addMessage);
+
+        merged.sort((a, b) => {
+            const diff = getStableMessageSortValue(a) - getStableMessageSortValue(b);
+            if (diff) return diff;
+            return (a.text || '').localeCompare(b.text || '');
+        });
+
+        STATE.stableMessages = merged.map((message, index) => snapshotMessageForStableCache(message, index));
+        writeStoredStableMessages(context, STATE.stableMessages);
+        if (merged.length > currentMessages.length) {
+            STATE.lastTocSource = `${STATE.lastTocSource || 'scan'}+stable-cache`;
+        }
+
+        return merged;
+    }
+
     function hydrateChatGptConversationMessages() {
         const conversationId = getChatGptConversationId();
         if (!conversationId || STATE.remoteFetchInFlight) return;
@@ -896,7 +1122,7 @@
             }));
 
             return {
-                version: '2.8.2',
+                version: '2.8.3',
                 conversationId: getChatGptConversationId(),
                 url: window.location.href,
                 adapterId: ADAPTER.id,
@@ -905,6 +1131,8 @@
                 liveDomUserMessages: document.querySelectorAll('[data-message-author-role="user"]').length,
                 nativeTocMessages: getChatGptNativeTocEntries().length,
                 tocMessages: STATE.messages.length,
+                stableMessages: STATE.stableMessages.length,
+                stableMessageContext: STATE.stableMessageContext,
                 remoteMessages: STATE.remoteMessages.length,
                 remoteMessageContext: STATE.remoteMessageContext,
                 remoteMessageSource: STATE.remoteMessageSource,
@@ -933,9 +1161,9 @@
             };
         };
         window.__aiTocDebug = debugFn;
-        window.__aiTocVersion = '2.8.2';
+        window.__aiTocVersion = '2.8.3';
         pageWindow.__aiTocDebug = debugFn;
-        pageWindow.__aiTocVersion = '2.8.2';
+        pageWindow.__aiTocVersion = '2.8.3';
     }
 
     function collectMessagesFromAdapter(adapter) {
@@ -3835,10 +4063,13 @@
             if (STATE.messageListContext !== context) {
                 STATE.messageListContext = context;
                 STATE.messages = [];
+                STATE.stableMessages = [];
+                STATE.stableMessageContext = '';
             } else if (STATE.messages.length > messages.length) {
                 messages = mergeRemoteAndLiveMessages(STATE.messages, messages);
                 STATE.lastTocSource = `${STATE.lastTocSource || 'scan'}+stable-snapshot`;
             }
+            messages = mergeChatGptStableMessages(messages);
         }
         annotateMessagesWithNativeToc(messages);
         STATE.messages = messages;
