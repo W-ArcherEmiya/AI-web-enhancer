@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ai-chat-outline
 // @namespace    http://tampermonkey.net/
-// @version      2.8.4
+// @version      2.8.5
 // @description  Adds a sidebar table of contents to ChatGPT, Gemini and Claude.
 // @author       ArcherEmiya
 // @match        https://gemini.google.com/*
@@ -37,7 +37,7 @@
     }
 
     cleanUpOldVersions();
-    console.log('ai-chat-outline v2.8.4: started');
+    console.log('ai-chat-outline v2.8.5: started');
 
     function getPageWindow() {
         try {
@@ -89,12 +89,13 @@
         autoCollapseTimer: 0,
         positionCache: [],
         positionsDirty: true,
-        stableMessages: [],
-        stableMessageContext: '',
-        stableNextOrder: 0,
+        chatGptCatalogMessages: [],
+        chatGptCatalogContext: '',
+        chatGptCatalogSource: '',
         remoteMessages: [],
         remoteMessageContext: '',
         remoteMessageSource: '',
+        remoteMessageIsAuthoritative: false,
         remoteFetchContext: '',
         remoteFetchInFlight: false,
         remoteFetchStatus: '',
@@ -103,6 +104,7 @@
         messageListContext: '',
         lastTocClick: null,
         lastNavigationDebug: null,
+        lastActiveDebug: null,
         virtualSeekTimer: 0,
         observer: null,
         globalEventsBound: false
@@ -112,8 +114,7 @@
         panelPosition: 'ai-toc-v2_5-panel-position',
         expandedPosition: 'ai-toc-v2_5-expanded-position',
         bubblePosition: 'ai-toc-v2_5-bubble-position',
-        collapsed: 'ai-toc-v2_5-collapsed',
-        stableMessagesPrefix: 'ai-toc-v2_8_4-stable-messages'
+        collapsed: 'ai-toc-v2_5-collapsed'
     };
 
     const PATHS = {
@@ -177,6 +178,14 @@
         return (node && node.textContent ? node.textContent : '').replace(/\s+/g, ' ').trim();
     }
 
+    function extractChatGptUserQueryText(element) {
+        if (!element || !element.querySelector) return normalizeMessageText(element);
+        const content = element.matches && element.matches('.whitespace-pre-wrap')
+            ? element
+            : element.querySelector('.whitespace-pre-wrap');
+        return normalizeMessageText(content || element);
+    }
+
     function normalizePlainText(text) {
         return (text || '').replace(/\s+/g, ' ').trim();
     }
@@ -202,6 +211,23 @@
         return liveText.includes(remoteText) || remoteText.includes(liveText);
     }
 
+    function findOrderedComparableTextIndex(texts, comparable, startIndex, usedIndexes) {
+        if (!comparable) return -1;
+        const start = typeof startIndex === 'number' ? startIndex : 0;
+
+        for (let i = start; i < texts.length; i++) {
+            if (usedIndexes && usedIndexes.has(i)) continue;
+            if (texts[i] === comparable) return i;
+        }
+
+        const compatibleIndexes = [];
+        for (let i = start; i < texts.length; i++) {
+            if (usedIndexes && usedIndexes.has(i)) continue;
+            if (isComparableTextMatch(texts[i], comparable)) compatibleIndexes.push(i);
+        }
+        return compatibleIndexes.length === 1 ? compatibleIndexes[0] : -1;
+    }
+
     function normalizeNativeTocText(text) {
         return normalizePlainText(text);
     }
@@ -211,11 +237,6 @@
         const toc = normalizeNativeTocText(tocText);
         if (!live || !toc) return false;
         if (live === toc) return true;
-
-        const comparableLive = getComparableMessageText(live);
-        const comparableToc = getComparableMessageText(toc);
-        if (isComparableTextMatch(comparableLive, comparableToc)) return true;
-
         return Math.min(live.length, toc.length) >= 200 && (live.startsWith(toc) || toc.startsWith(live));
     }
 
@@ -284,10 +305,19 @@
             const normalized = normalizeNativeTocText(text);
             textCounts.set(normalized, (textCounts.get(normalized) || 0) + 1);
         });
+        const hasPrefixAmbiguity = (text) => {
+            const normalized = normalizeNativeTocText(text);
+            if (!normalized) return true;
+            return texts.some((candidate) => {
+                const comparable = normalizeNativeTocText(candidate);
+                return comparable && comparable !== normalized &&
+                    (normalized.startsWith(comparable) || comparable.startsWith(normalized));
+            });
+        };
 
         const liveByText = new Map();
         Array.from(document.querySelectorAll('[data-message-author-role="user"]')).forEach((element) => {
-            const text = normalizeNativeTocText(normalizeMessageText(element));
+            const text = normalizeNativeTocText(extractChatGptUserQueryText(element));
             if (!text) return;
             const group = liveByText.get(text) || [];
             group.push(element);
@@ -298,7 +328,11 @@
             const text = texts[index] || '';
             const normalizedText = normalizeNativeTocText(text);
             const liveMatches = liveByText.get(normalizedText) || [];
-            const uniqueLiveElement = textCounts.get(normalizedText) === 1 && liveMatches.length === 1 ? liveMatches[0] : null;
+            const uniqueLiveElement = textCounts.get(normalizedText) === 1 &&
+                !hasPrefixAmbiguity(text) &&
+                liveMatches.length === 1
+                ? liveMatches[0]
+                : null;
             return {
                 index: getChatGptNativeTocButtonIndex(button, index),
                 text,
@@ -329,14 +363,25 @@
         if (!entries.length) return messages;
 
         const used = new Set();
+        const canUseListPosition = messages.length === entries.length;
         messages.forEach((message, messageIndex) => {
             const remoteIndex = getMessageRemoteIndex(message, messageIndex);
-            let entry = entries.find((entry) => entry.index === remoteIndex && !used.has(entry.index));
+            const hasAuthoritativeIndex = typeof message.remoteIndex === 'number' ||
+                typeof message.nativeTocIndex === 'number';
+            let entry = null;
+            if (hasAuthoritativeIndex || canUseListPosition) {
+                entry = entries.find((candidate) => (
+                    candidate.index === remoteIndex &&
+                    !used.has(candidate.index) &&
+                    isCompatibleNativeTocText(message.text, candidate.text)
+                ));
+            }
             if (!entry) {
-                entry = entries.find((candidate) => {
+                const compatibleEntries = entries.filter((candidate) => {
                     if (used.has(candidate.index)) return false;
                     return isCompatibleNativeTocText(message.text, candidate.text);
                 });
+                entry = compatibleEntries.length === 1 ? compatibleEntries[0] : null;
             }
             if (!entry) return;
 
@@ -389,7 +434,7 @@
 
         const patterns = [
             /\/c\/([0-9a-f-]{20,})/i,
-            /\/backend-api\/conversation\/([0-9a-f-]{20,})/i,
+            /\/backend-api\/(?:f\/)?conversations?\/([0-9a-f-]{20,})/i,
             /[?&]conversation_id=([0-9a-f-]{20,})/i
         ];
 
@@ -534,19 +579,6 @@
             });
     }
 
-    function getAllConversationNodes(data) {
-        const mapping = data && data.mapping ? data.mapping : null;
-        if (!mapping) return [];
-
-        return Object.keys(mapping)
-            .map((key) => mapping[key])
-            .sort((a, b) => {
-                const aTime = a && a.message && typeof a.message.create_time === 'number' ? a.message.create_time : 0;
-                const bTime = b && b.message && typeof b.message.create_time === 'number' ? b.message.create_time : 0;
-                return aTime - bTime;
-            });
-    }
-
     function shouldUseConversationMessage(message) {
         if (!message) return false;
         const metadata = message.metadata || {};
@@ -582,9 +614,7 @@
     }
 
     function extractChatGptUserMessages(data) {
-        const pathMessages = extractChatGptUserMessagesFromNodes(getConversationPathNodes(data));
-        const allMessages = extractChatGptUserMessagesFromNodes(getAllConversationNodes(data));
-        return allMessages.length > pathMessages.length ? allMessages : pathMessages;
+        return extractChatGptUserMessagesFromNodes(getConversationPathNodes(data));
     }
 
     function applyChatGptConversationData(data, source, contextOverride) {
@@ -597,7 +627,9 @@
         }
 
         const context = contextOverride || getChatGptMessageCacheContext();
-        if (STATE.remoteMessageContext === context && STATE.remoteMessages.length > messages.length) {
+        const mapping = data && data.mapping ? data.mapping : null;
+        const hasCurrentPath = !!(mapping && data.current_node && mapping[data.current_node]);
+        if (!hasCurrentPath && STATE.remoteMessageContext === context && STATE.remoteMessages.length > messages.length) {
             STATE.remoteFetchStatus = `${source}:ignored-short:${messages.length}<${STATE.remoteMessages.length}`;
             return false;
         }
@@ -605,7 +637,8 @@
         STATE.remoteMessages = messages;
         STATE.remoteMessageContext = context;
         STATE.remoteMessageSource = source;
-        STATE.remoteFetchStatus = `${source}:ok:${messages.length}`;
+        STATE.remoteMessageIsAuthoritative = hasCurrentPath;
+        STATE.remoteFetchStatus = `${source}:${hasCurrentPath ? 'current-path' : 'fallback'}:ok:${messages.length}`;
         scheduleScan(0);
         return true;
     }
@@ -614,24 +647,24 @@
         const liveByRemoteIndex = new Map();
         const usedRemoteIndexes = new Set();
         let nextRemoteIndex = 0;
+        const remoteTexts = remoteMessages.map((message) => getComparableMessageText(message.text));
 
         liveMessages.forEach((liveMessage) => {
             const liveText = getComparableMessageText(liveMessage.text);
             if (!liveText) return;
 
-            let matchedIndex = -1;
-            let matchType = '';
-            for (let i = nextRemoteIndex; i < remoteMessages.length; i++) {
-                if (usedRemoteIndexes.has(i)) continue;
-                const remoteText = getComparableMessageText(remoteMessages[i].text);
-                if (!isComparableTextMatch(remoteText, liveText)) continue;
-
-                matchedIndex = i;
-                matchType = remoteText === liveText ? 'exact-text-order' : 'contained-text-order';
-                break;
-            }
+            const matchedIndex = findOrderedComparableTextIndex(
+                remoteTexts,
+                liveText,
+                nextRemoteIndex,
+                usedRemoteIndexes
+            );
 
             if (matchedIndex < 0) return;
+
+            const matchType = remoteTexts[matchedIndex] === liveText
+                ? 'exact-text-order'
+                : 'contained-text-order';
 
             usedRemoteIndexes.add(matchedIndex);
             liveByRemoteIndex.set(matchedIndex, liveMessage);
@@ -648,16 +681,10 @@
         let nextRemoteIndex = 0;
 
         return Array.from(document.querySelectorAll('[data-message-author-role="user"]')).map((element, liveIndex) => {
-            const liveText = normalizeMessageText(element);
+            const liveText = extractChatGptUserQueryText(element);
             const comparable = getComparableMessageText(liveText);
-            let matchedRemoteIndex = -1;
-
-            for (let i = nextRemoteIndex; i < remoteTexts.length; i++) {
-                if (!isComparableTextMatch(remoteTexts[i], comparable)) continue;
-                matchedRemoteIndex = i;
-                nextRemoteIndex = i + 1;
-                break;
-            }
+            const matchedRemoteIndex = findOrderedComparableTextIndex(remoteTexts, comparable, nextRemoteIndex);
+            if (matchedRemoteIndex >= 0) nextRemoteIndex = matchedRemoteIndex + 1;
 
             return {
                 liveIndex,
@@ -673,18 +700,13 @@
         let nextRemoteIndex = 0;
 
         return Array.from(document.querySelectorAll('[data-message-author-role="user"]')).reduce((matches, element, liveIndex) => {
-            const liveText = normalizeMessageText(element);
+            const liveText = extractChatGptUserQueryText(element);
             const comparable = getComparableMessageText(liveText);
-            let matchedRemoteIndex = -1;
-            let matchType = '';
-
-            for (let i = nextRemoteIndex; i < remoteTexts.length; i++) {
-                if (!isComparableTextMatch(remoteTexts[i], comparable)) continue;
-                matchedRemoteIndex = i;
-                matchType = remoteTexts[i] === comparable ? 'exact-text-order' : 'contained-text-order';
-                nextRemoteIndex = i + 1;
-                break;
-            }
+            const matchedRemoteIndex = findOrderedComparableTextIndex(remoteTexts, comparable, nextRemoteIndex);
+            const matchType = matchedRemoteIndex >= 0
+                ? (remoteTexts[matchedRemoteIndex] === comparable ? 'exact-text-order' : 'contained-text-order')
+                : '';
+            if (matchedRemoteIndex >= 0) nextRemoteIndex = matchedRemoteIndex + 1;
 
             if (matchedRemoteIndex >= 0) {
                 matches.push({
@@ -768,49 +790,202 @@
         return merged;
     }
 
-    function getStableMessageKeys(message) {
-        if (!message) return [];
-
-        const keys = [];
-        getMessageIdentityKeys(message).forEach((key) => keys.push(key));
-
-        if (typeof message.remoteIndex === 'number') {
-            keys.push(`remote:${message.remoteIndex}`);
-        }
-        if (typeof message.nativeTocIndex === 'number') {
-            keys.push(`native:${message.nativeTocIndex}`);
-        }
-        if (message.navigationId) {
-            keys.push(`navigation:${message.navigationId}`);
-        }
-
-        if (keys.length) return Array.from(new Set(keys));
-
-        const comparable = getComparableMessageText(message.text);
-        if (comparable) {
-            keys.push(`text:${comparable.slice(0, 240)}`);
-        }
-
-        return Array.from(new Set(keys));
+    function snapshotChatGptCatalogMessages(messages) {
+        return messages.map((message, index) => {
+            const snapshot = snapshotChatGptCatalogMessage(message, index);
+            if (typeof snapshot.remoteIndex !== 'number' && typeof snapshot.nativeTocIndex !== 'number') {
+                snapshot.remoteIndex = index;
+            }
+            return snapshot;
+        });
     }
 
-    function getObservedMessageTop(message) {
-        if (message && typeof message.observedTop === 'number') return message.observedTop;
+    function replaceChatGptCatalog(messages, context, source) {
+        STATE.chatGptCatalogMessages = snapshotChatGptCatalogMessages(messages);
+        STATE.chatGptCatalogContext = context;
+        STATE.chatGptCatalogSource = source;
+    }
 
+    function getChatGptMessageTurnIndex(message, fallbackIndex) {
+        if (message && typeof message.turnIndex === 'number') return message.turnIndex;
         const target = getMessageTarget(message);
-        if (!target || !target.isConnected) return;
-
-        const container = findScrollContainerForElement(target);
-        return getMessageAbsoluteTop(message, container);
+        const turn = target && target.closest
+            ? target.closest('[data-testid^="conversation-turn-"]')
+            : null;
+        if (turn) {
+            const match = /^conversation-turn-(\d+)/.exec(turn.getAttribute('data-testid') || '');
+            if (match && match[1]) {
+                const parsed = Number.parseInt(match[1], 10);
+                if (!Number.isNaN(parsed)) return parsed;
+            }
+        }
+        return typeof fallbackIndex === 'number' ? fallbackIndex + 1000000 : Number.MAX_SAFE_INTEGER;
     }
 
-    function snapshotMessageForStableCache(message, fallbackIndex) {
+    function getChatGptMessageTurnId(message) {
+        if (message && message.turnId) return message.turnId;
+        const target = getMessageTarget(message);
+        const turn = target && target.closest
+            ? target.closest('[data-turn-id-container], [data-turn-id]')
+            : null;
+        return turn
+            ? turn.getAttribute('data-turn-id-container') || turn.getAttribute('data-turn-id') || ''
+            : '';
+    }
+
+    function mergeLiveMessagesIntoChatGptCatalog(liveMessages, context) {
+        const existing = STATE.chatGptCatalogContext === context
+            ? STATE.chatGptCatalogMessages.map(snapshotChatGptCatalogMessage)
+            : [];
+        const byIdentity = new Map();
+        const byTurnId = new Map();
+
+        existing.forEach((message) => {
+            getMessageIdentityKeys(message).forEach((key) => {
+                if (!byIdentity.has(key)) byIdentity.set(key, message);
+            });
+            const turnId = getChatGptMessageTurnId(message);
+            if (turnId && !byTurnId.has(turnId)) byTurnId.set(turnId, message);
+        });
+
+        liveMessages.forEach((liveMessage, liveIndex) => {
+            const identityKeys = getMessageIdentityKeys(liveMessage);
+            let cached = null;
+            for (let i = 0; i < identityKeys.length; i++) {
+                if (byIdentity.has(identityKeys[i])) {
+                    cached = byIdentity.get(identityKeys[i]);
+                    break;
+                }
+            }
+            const liveTurnId = getChatGptMessageTurnId(liveMessage);
+            if (!cached && liveTurnId && byTurnId.has(liveTurnId)) {
+                cached = byTurnId.get(liveTurnId);
+            }
+
+            if (!cached) {
+                cached = snapshotChatGptCatalogMessage(liveMessage, liveIndex);
+                cached.turnIndex = getChatGptMessageTurnIndex(liveMessage, liveIndex);
+                cached.turnId = liveTurnId;
+                existing.push(cached);
+            } else {
+                const rebound = snapshotChatGptCatalogMessage(liveMessage, liveIndex);
+                cached.anchor = rebound.anchor;
+                cached.container = rebound.container;
+                cached.text = rebound.text || cached.text;
+                cached.identityKeys = createMessageIdentityKeys.apply(
+                    null,
+                    getMessageIdentityKeys(cached).concat(identityKeys)
+                );
+                cached.identityKey = cached.identityKeys[0] || '';
+                cached.turnIndex = Math.min(
+                    getChatGptMessageTurnIndex(cached, liveIndex),
+                    getChatGptMessageTurnIndex(liveMessage, liveIndex)
+                );
+                cached.turnId = cached.turnId || liveTurnId;
+                cached.anchorSource = 'turn-cache-live-anchor';
+            }
+
+            getMessageIdentityKeys(cached).forEach((key) => byIdentity.set(key, cached));
+            if (cached.turnId) byTurnId.set(cached.turnId, cached);
+        });
+
+        existing.sort((a, b) => {
+            const aTurn = getChatGptMessageTurnIndex(a);
+            const bTurn = getChatGptMessageTurnIndex(b);
+            if (aTurn !== bTurn) return aTurn - bTurn;
+            return (a.observedIndex || 0) - (b.observedIndex || 0);
+        });
+        existing.forEach((message, index) => {
+            message.remoteIndex = index;
+        });
+
+        replaceChatGptCatalog(existing, context, 'live-turn-cache');
+        return bindLiveMessagesToChatGptCatalog(STATE.chatGptCatalogMessages, liveMessages);
+    }
+
+    function bindLiveMessagesToChatGptCatalog(catalogMessages, liveMessages) {
+        if (!catalogMessages.length) return [];
+        annotateMessagesWithNativeToc(liveMessages);
+
+        const usedLiveMessages = new Set();
+        const liveByIdentity = new Map();
+        const liveByOrder = new Map();
+        const catalogTextCounts = new Map();
+        const liveByText = new Map();
+
+        catalogMessages.forEach((message) => {
+            const comparable = getComparableMessageText(message.text);
+            if (comparable) catalogTextCounts.set(comparable, (catalogTextCounts.get(comparable) || 0) + 1);
+        });
+
+        liveMessages.forEach((message) => {
+            getMessageIdentityKeys(message).forEach((key) => {
+                if (!liveByIdentity.has(key)) liveByIdentity.set(key, message);
+            });
+
+            const order = typeof message.nativeTocIndex === 'number'
+                ? message.nativeTocIndex
+                : message.remoteIndex;
+            if (typeof order === 'number' && !liveByOrder.has(order)) liveByOrder.set(order, message);
+
+            const comparable = getComparableMessageText(message.text);
+            if (comparable) {
+                const group = liveByText.get(comparable) || [];
+                group.push(message);
+                liveByText.set(comparable, group);
+            }
+        });
+
+        const rebound = catalogMessages.map((catalogMessage, index) => {
+            const snapshot = snapshotChatGptCatalogMessage(catalogMessage, index);
+            const catalogOrder = typeof snapshot.nativeTocIndex === 'number'
+                ? snapshot.nativeTocIndex
+                : snapshot.remoteIndex;
+            let liveMessage = typeof catalogOrder === 'number' ? liveByOrder.get(catalogOrder) : null;
+
+            if (!liveMessage) {
+                const keys = getMessageIdentityKeys(snapshot);
+                for (let i = 0; i < keys.length; i++) {
+                    const candidate = liveByIdentity.get(keys[i]);
+                    if (candidate && !usedLiveMessages.has(candidate)) {
+                        liveMessage = candidate;
+                        break;
+                    }
+                }
+            }
+
+            if (!liveMessage) {
+                const comparable = getComparableMessageText(snapshot.text);
+                const candidates = comparable ? liveByText.get(comparable) || [] : [];
+                if (catalogTextCounts.get(comparable) === 1 && candidates.length === 1) {
+                    liveMessage = candidates[0];
+                }
+            }
+
+            if (!liveMessage || usedLiveMessages.has(liveMessage)) return snapshot;
+            usedLiveMessages.add(liveMessage);
+
+            snapshot.anchor = liveMessage.anchor && liveMessage.anchor.isConnected ? liveMessage.anchor : null;
+            snapshot.container = liveMessage.container && liveMessage.container.isConnected ? liveMessage.container : null;
+            snapshot.identityKeys = createMessageIdentityKeys.apply(
+                null,
+                getMessageIdentityKeys(snapshot).concat(getMessageIdentityKeys(liveMessage))
+            );
+            snapshot.identityKey = snapshot.identityKeys[0] || '';
+            snapshot.anchorSource = liveMessage.anchorSource || 'catalog-live-anchor';
+            return snapshot;
+        });
+
+        STATE.chatGptCatalogMessages = snapshotChatGptCatalogMessages(rebound);
+        return rebound;
+    }
+
+    function snapshotChatGptCatalogMessage(message, fallbackIndex) {
         const target = getMessageTarget(message);
         const targetConnected = !!(target && target.isConnected);
         const anchorConnected = !!(message && message.anchor && message.anchor.isConnected);
         const containerConnected = !!(message && message.container && message.container.isConnected);
         const identityKeys = getMessageIdentityKeys(message);
-        const observedTop = getObservedMessageTop(message);
         const snapshot = {
             container: containerConnected ? message.container : (targetConnected ? target : null),
             anchor: anchorConnected ? message.anchor : (targetConnected ? target : null),
@@ -821,9 +996,15 @@
             nativeTocText: message && message.nativeTocText ? message.nativeTocText : '',
             source: message && message.source ? message.source : '',
             anchorSource: message && message.anchorSource ? message.anchorSource : '',
-            stableOrder: message && typeof message.stableOrder === 'number' ? message.stableOrder : undefined,
             observedIndex: message && typeof message.observedIndex === 'number' ? message.observedIndex : fallbackIndex
         };
+
+        if (message && typeof message.turnIndex === 'number') {
+            snapshot.turnIndex = message.turnIndex;
+        }
+        if (message && message.turnId) {
+            snapshot.turnId = message.turnId;
+        }
 
         if (message && typeof message.remoteIndex === 'number') {
             snapshot.remoteIndex = message.remoteIndex;
@@ -831,205 +1012,7 @@
         if (message && typeof message.nativeTocIndex === 'number') {
             snapshot.nativeTocIndex = message.nativeTocIndex;
         }
-        if (typeof observedTop === 'number') {
-            snapshot.observedTop = observedTop;
-        }
-
         return snapshot;
-    }
-
-    function serializeStableMessage(message, index) {
-        const snapshot = snapshotMessageForStableCache(message, index);
-        const serialized = {
-            text: snapshot.text,
-            identityKey: snapshot.identityKey,
-            identityKeys: snapshot.identityKeys,
-            navigationId: snapshot.navigationId,
-            nativeTocText: snapshot.nativeTocText,
-            source: snapshot.source,
-            anchorSource: snapshot.anchorSource,
-            stableOrder: typeof snapshot.stableOrder === 'number' ? snapshot.stableOrder : index,
-            observedIndex: typeof snapshot.observedIndex === 'number' ? snapshot.observedIndex : index
-        };
-
-        if (typeof snapshot.remoteIndex === 'number') serialized.remoteIndex = snapshot.remoteIndex;
-        if (typeof snapshot.nativeTocIndex === 'number') serialized.nativeTocIndex = snapshot.nativeTocIndex;
-        if (typeof snapshot.observedTop === 'number') serialized.observedTop = snapshot.observedTop;
-        return serialized;
-    }
-
-    function getStableMessageStorageKey(context) {
-        if (!context) return '';
-        return `${STORAGE_KEYS.stableMessagesPrefix}:${context}`;
-    }
-
-    function readStoredStableMessages(context) {
-        const key = getStableMessageStorageKey(context);
-        if (!key) return [];
-
-        const raw = readStorageValue(key);
-        if (!raw) return [];
-
-        try {
-            const parsed = JSON.parse(raw);
-            const messages = Array.isArray(parsed) ? parsed : parsed.messages;
-            if (!Array.isArray(messages)) return [];
-
-            return messages
-                .filter((message) => message && typeof message.text === 'string' && message.text.trim())
-                .map((message, index) => ({
-                    container: null,
-                    anchor: null,
-                    text: message.text,
-                    identityKey: message.identityKey || '',
-                    identityKeys: Array.isArray(message.identityKeys) ? message.identityKeys : createMessageIdentityKeys(message.identityKey),
-                    navigationId: message.navigationId || '',
-                    nativeTocText: message.nativeTocText || '',
-                    source: message.source || 'stable-cache',
-                    anchorSource: message.anchorSource || '',
-                    remoteIndex: typeof message.remoteIndex === 'number' ? message.remoteIndex : undefined,
-                    nativeTocIndex: typeof message.nativeTocIndex === 'number' ? message.nativeTocIndex : undefined,
-                    observedTop: typeof message.observedTop === 'number' ? message.observedTop : undefined,
-                    stableOrder: typeof message.stableOrder === 'number' ? message.stableOrder : index,
-                    observedIndex: typeof message.observedIndex === 'number' ? message.observedIndex : index
-                }));
-        } catch (error) {
-            return [];
-        }
-    }
-
-    function writeStoredStableMessages(context, messages) {
-        const key = getStableMessageStorageKey(context);
-        if (!key || !messages.length) return;
-
-        const payload = {
-            version: 1,
-            updatedAt: Date.now(),
-            messages: messages.slice(0, 400).map(serializeStableMessage)
-        };
-        writeStorageValue(key, JSON.stringify(payload));
-    }
-
-    function mergeStableMessage(existing, incoming) {
-        if (!existing) return incoming;
-
-        if (incoming.text && (!existing.text || incoming.text.length >= existing.text.length)) {
-            existing.text = incoming.text;
-        }
-
-        if (incoming.anchor && incoming.anchor.isConnected) existing.anchor = incoming.anchor;
-        if (incoming.container && incoming.container.isConnected) existing.container = incoming.container;
-        if (incoming.navigationId) existing.navigationId = incoming.navigationId;
-        if (incoming.nativeTocText) existing.nativeTocText = incoming.nativeTocText;
-        if (incoming.source) existing.source = incoming.source;
-        if (incoming.anchorSource) existing.anchorSource = incoming.anchorSource;
-        if (typeof incoming.remoteIndex === 'number') existing.remoteIndex = incoming.remoteIndex;
-        if (typeof incoming.nativeTocIndex === 'number') existing.nativeTocIndex = incoming.nativeTocIndex;
-        if (typeof incoming.observedTop === 'number') existing.observedTop = incoming.observedTop;
-        if (typeof incoming.stableOrder === 'number') {
-            existing.stableOrder = typeof existing.stableOrder === 'number'
-                ? Math.min(existing.stableOrder, incoming.stableOrder)
-                : incoming.stableOrder;
-        }
-        if (typeof incoming.observedIndex === 'number') {
-            existing.observedIndex = typeof existing.observedIndex === 'number'
-                ? Math.min(existing.observedIndex, incoming.observedIndex)
-                : incoming.observedIndex;
-        }
-
-        existing.identityKeys = createMessageIdentityKeys.apply(
-            null,
-            getMessageIdentityKeys(existing).concat(getMessageIdentityKeys(incoming))
-        );
-        existing.identityKey = existing.identityKeys[0] || existing.identityKey || incoming.identityKey || '';
-        return existing;
-    }
-
-    function getStableMessageSortValue(message) {
-        if (message && typeof message.stableOrder === 'number') return message.stableOrder;
-        if (message && typeof message.remoteIndex === 'number') return message.remoteIndex;
-        if (message && typeof message.nativeTocIndex === 'number') return message.nativeTocIndex;
-        if (message && typeof message.observedIndex === 'number') return message.observedIndex;
-        return Number.MAX_SAFE_INTEGER;
-    }
-
-    function getAuthoritativeMessageOrder(message) {
-        if (message && typeof message.remoteIndex === 'number') return message.remoteIndex;
-        if (message && typeof message.nativeTocIndex === 'number') return message.nativeTocIndex;
-        if (message && typeof message.stableOrder === 'number') return message.stableOrder;
-        return;
-    }
-
-    function ensureStableMessageOrder(message, fallback, allowFallbackOrder) {
-        if (typeof message.stableOrder === 'number') return;
-
-        const authoritativeOrder = getAuthoritativeMessageOrder(message);
-        if (typeof authoritativeOrder === 'number' && authoritativeOrder >= 0) {
-            message.stableOrder = authoritativeOrder;
-            STATE.stableNextOrder = Math.max(STATE.stableNextOrder, authoritativeOrder + 1);
-            return;
-        }
-
-        message.stableOrder = allowFallbackOrder && typeof fallback === 'number'
-            ? fallback
-            : STATE.stableNextOrder;
-        STATE.stableNextOrder += 1;
-    }
-
-    function mergeChatGptStableMessages(currentMessages) {
-        const context = getChatGptMessageCacheContext();
-        if (STATE.stableMessageContext !== context) {
-            STATE.stableMessageContext = context;
-            STATE.stableMessages = readStoredStableMessages(context);
-            STATE.stableNextOrder = STATE.stableMessages.reduce((maxOrder, message, index) => {
-                const order = typeof message.stableOrder === 'number' ? message.stableOrder : index;
-                message.stableOrder = order;
-                return Math.max(maxOrder, order + 1);
-            }, 0);
-        }
-
-        const merged = [];
-        const byKey = new Map();
-        const hadStableMessages = STATE.stableMessages.length > 0;
-        const addMessage = (message, index, allowFallbackOrder) => {
-            const snapshot = snapshotMessageForStableCache(message, index);
-            if (!snapshot.text) return;
-
-            const keys = getStableMessageKeys(snapshot);
-            let existing = null;
-            for (let i = 0; i < keys.length; i++) {
-                existing = byKey.get(keys[i]);
-                if (existing) break;
-            }
-
-            if (!existing) {
-                existing = snapshot;
-                ensureStableMessageOrder(existing, index, allowFallbackOrder);
-                merged.push(existing);
-            } else {
-                mergeStableMessage(existing, snapshot);
-                ensureStableMessageOrder(existing, index, allowFallbackOrder);
-            }
-
-            getStableMessageKeys(existing).forEach((key) => byKey.set(key, existing));
-        };
-
-        STATE.stableMessages.forEach((message, index) => addMessage(message, index, true));
-        currentMessages.forEach((message, index) => addMessage(message, index, !hadStableMessages));
-
-        merged.sort((a, b) => {
-            const diff = getStableMessageSortValue(a) - getStableMessageSortValue(b);
-            if (diff) return diff;
-            return (a.observedIndex || 0) - (b.observedIndex || 0);
-        });
-
-        STATE.stableMessages = merged.map((message, index) => snapshotMessageForStableCache(message, index));
-        writeStoredStableMessages(context, STATE.stableMessages);
-        if (merged.length > currentMessages.length) {
-            STATE.lastTocSource = `${STATE.lastTocSource || 'scan'}+stable-cache`;
-        }
-
-        return merged;
     }
 
     function hydrateChatGptConversationMessages() {
@@ -1064,7 +1047,7 @@
     }
 
     function isChatGptConversationResponseUrl(url) {
-        return !!(url && /\/backend-api\/conversation\/[0-9a-f-]{20,}/i.test(url));
+        return !!(url && /\/backend-api\/(?:f\/)?conversations?\/[0-9a-f-]{20,}/i.test(url));
     }
 
     function readConversationResponse(response, source) {
@@ -1137,8 +1120,10 @@
         const pageWindow = getPageWindow();
         const debugFn = function aiTocDebug() {
             const alignmentMatches = getCurrentTextAlignmentMatches();
+            const nativeTocButtons = getChatGptNativeTocButtons();
+            const nativeTocTexts = getChatGptNativeTocTexts(nativeTocButtons);
             const liveSamples = Array.from(document.querySelectorAll('[data-message-author-role="user"]')).map((element, index) => {
-                const text = normalizeMessageText(element);
+                const text = extractChatGptUserQueryText(element);
                 return {
                     index,
                     identityKey: getMessageIdentityKeyFromElement(element),
@@ -1160,11 +1145,28 @@
             }));
             const adapterSamples = Array.from(document.querySelectorAll(ADAPTER.selector)).map((element, index) => ({
                 index,
-                text: normalizeMessageText(element).slice(0, 120)
+                text: ADAPTER.id === 'chatgpt'
+                    ? extractChatGptUserQueryText(element).slice(0, 120)
+                    : normalizeMessageText(element).slice(0, 120)
             }));
+            const duplicateTextGroups = Array.from(STATE.messages.reduce((groups, message, index) => {
+                const comparable = getComparableMessageText(message.text);
+                if (!comparable) return groups;
+                const group = groups.get(comparable) || [];
+                group.push({
+                    index,
+                    identityKeys: getMessageIdentityKeys(message),
+                    remoteIndex: typeof message.remoteIndex === 'number' ? message.remoteIndex : null,
+                    nativeTocIndex: typeof message.nativeTocIndex === 'number' ? message.nativeTocIndex : null,
+                    stableOrder: typeof message.stableOrder === 'number' ? message.stableOrder : null,
+                    text: message.text.slice(0, 120)
+                });
+                groups.set(comparable, group);
+                return groups;
+            }, new Map()).values()).filter((group) => group.length > 1);
 
             return {
-                version: '2.8.4',
+                version: '2.8.5',
                 conversationId: getChatGptConversationId(),
                 url: window.location.href,
                 adapterId: ADAPTER.id,
@@ -1172,13 +1174,19 @@
                 adapterMatches: adapterSamples.length,
                 liveDomUserMessages: document.querySelectorAll('[data-message-author-role="user"]').length,
                 nativeTocMessages: getChatGptNativeTocEntries().length,
+                nativeTocButtons: nativeTocButtons.length,
+                nativeTocTexts: nativeTocTexts.length,
+                nativeTocButtonLabels: nativeTocButtons.slice(0, 12).map((button) => button.getAttribute('aria-label') || ''),
+                nativeTocTextSamples: nativeTocTexts.slice(0, 12),
+                userMessageSlots: getChatGptMessageSlotSummary().filter((slot) => slot.userIndex !== null).length,
                 tocMessages: STATE.messages.length,
-                stableMessages: STATE.stableMessages.length,
-                stableMessageContext: STATE.stableMessageContext,
-                stableNextOrder: STATE.stableNextOrder,
+                chatGptCatalogMessages: STATE.chatGptCatalogMessages.length,
+                chatGptCatalogContext: STATE.chatGptCatalogContext,
+                chatGptCatalogSource: STATE.chatGptCatalogSource,
                 remoteMessages: STATE.remoteMessages.length,
                 remoteMessageContext: STATE.remoteMessageContext,
                 remoteMessageSource: STATE.remoteMessageSource,
+                remoteMessageIsAuthoritative: STATE.remoteMessageIsAuthoritative,
                 remoteFetchContext: STATE.remoteFetchContext,
                 remoteFetchInFlight: STATE.remoteFetchInFlight,
                 remoteFetchStatus: STATE.remoteFetchStatus,
@@ -1199,14 +1207,16 @@
                 liveSamples,
                 remoteSamples,
                 nativeTocSamples,
+                duplicateTextGroups,
                 lastTocClick: STATE.lastTocClick,
-                lastNavigationDebug: STATE.lastNavigationDebug
+                lastNavigationDebug: STATE.lastNavigationDebug,
+                lastActiveDebug: STATE.lastActiveDebug
             };
         };
         window.__aiTocDebug = debugFn;
-        window.__aiTocVersion = '2.8.4';
+        window.__aiTocVersion = '2.8.5';
         pageWindow.__aiTocDebug = debugFn;
-        pageWindow.__aiTocVersion = '2.8.4';
+        pageWindow.__aiTocVersion = '2.8.5';
     }
 
     function collectMessagesFromAdapter(adapter) {
@@ -1321,21 +1331,17 @@
             },
             beforeCollect() {
                 const context = getChatGptMessageCacheContext();
-                if (STATE.remoteMessageContext && STATE.remoteMessageContext !== context) {
-                    STATE.remoteMessages = [];
-                    STATE.remoteMessageContext = '';
-                    STATE.remoteMessageSource = '';
-                    STATE.remoteFetchContext = '';
-                    STATE.remoteFetchStatus = '';
+                if (STATE.chatGptCatalogContext && STATE.chatGptCatalogContext !== context) {
+                    STATE.chatGptCatalogMessages = [];
+                    STATE.chatGptCatalogContext = '';
+                    STATE.chatGptCatalogSource = '';
                 }
-
-                hydrateChatGptConversationMessages();
             },
             resolveMessageContainer(line) {
                 return line.closest('[data-message-author-role]') || resolveGroupedMessageContainer(line, this.selector);
             },
             getMessageLabel(line, container) {
-                const text = normalizeMessageText(line);
+                const text = extractChatGptUserQueryText(line);
                 return text || extractImageLabel(container);
             },
             getScrollReferenceTargets(messages) {
@@ -1345,31 +1351,35 @@
                 return [];
             },
             mergeMessages(liveMessages) {
-                const nativeTocMessages = collectChatGptNativeTocMessages();
-                const fallbackMessages = nativeTocMessages.length > liveMessages.length
-                    ? nativeTocMessages
-                    : liveMessages;
                 const context = getChatGptMessageCacheContext();
-                if (STATE.remoteMessageContext === context && STATE.remoteMessages.length) {
-                    const mergedMessages = mergeRemoteAndLiveMessages(STATE.remoteMessages, liveMessages);
-                    if (fallbackMessages.length > mergedMessages.length) {
-                        STATE.lastTocSource = nativeTocMessages.length > liveMessages.length
-                            ? 'native-toc-larger-than-remote'
-                            : 'live-dom-larger-than-remote';
-                        return fallbackMessages;
+                annotateMessagesWithNativeToc(liveMessages);
+                const nativeTocMessages = collectChatGptNativeTocMessages();
+                if (nativeTocMessages.length) {
+                    replaceChatGptCatalog(nativeTocMessages, context, 'native-prompt-toc');
+                    STATE.lastTocSource = 'native-prompt-toc';
+                    return bindLiveMessagesToChatGptCatalog(STATE.chatGptCatalogMessages, liveMessages);
+                }
+
+                if (
+                    STATE.remoteMessageContext === context &&
+                    STATE.remoteMessageIsAuthoritative &&
+                    STATE.remoteMessages.length
+                ) {
+                    replaceChatGptCatalog(STATE.remoteMessages, context, `${STATE.remoteMessageSource}-current-branch`);
+                    STATE.lastTocSource = STATE.chatGptCatalogSource;
+                    return bindLiveMessagesToChatGptCatalog(STATE.chatGptCatalogMessages, liveMessages);
+                }
+
+                if (STATE.chatGptCatalogContext === context && STATE.chatGptCatalogMessages.length) {
+                    STATE.lastTocSource = `${STATE.chatGptCatalogSource}+retained`;
+                    if (STATE.chatGptCatalogSource === 'live-turn-cache') {
+                        return mergeLiveMessagesIntoChatGptCatalog(liveMessages, context);
                     }
-
-                    STATE.lastTocSource = `remote:${STATE.remoteMessageSource || 'conversation'}`;
-                    return mergedMessages;
+                    return bindLiveMessagesToChatGptCatalog(STATE.chatGptCatalogMessages, liveMessages);
                 }
 
-                if (fallbackMessages === nativeTocMessages) {
-                    STATE.lastTocSource = 'native-toc-fallback';
-                    return nativeTocMessages;
-                }
-
-                STATE.lastTocSource = 'live-dom-fallback';
-                return liveMessages;
+                STATE.lastTocSource = 'live-turn-cache';
+                return mergeLiveMessagesIntoChatGptCatalog(liveMessages, context);
             }
         },
         gemini: {
@@ -2155,15 +2165,23 @@
         return false;
     }
 
+    function isRelevantChatGptNativeTocMutation(node) {
+        if (ADAPTER.id !== 'chatgpt') return false;
+        const element = getMutationElement(node);
+        if (!element || isPanelMutation(element)) return false;
+        if (element.matches && element.matches('button[aria-label^="Prompt "]')) return true;
+        return !!(element.querySelector && element.querySelector('button[aria-label^="Prompt "]'));
+    }
+
     function mutationAffectsMessages(mutation) {
-        if (isRelevantMessageMutation(mutation.target)) return true;
+        if (isRelevantMessageMutation(mutation.target) || isRelevantChatGptNativeTocMutation(mutation.target)) return true;
 
         for (const node of mutation.addedNodes) {
-            if (isRelevantMessageMutation(node)) return true;
+            if (isRelevantMessageMutation(node) || isRelevantChatGptNativeTocMutation(node)) return true;
         }
 
         for (const node of mutation.removedNodes) {
-            if (isRelevantMessageMutation(node)) return true;
+            if (isRelevantMessageMutation(node) || isRelevantChatGptNativeTocMutation(node)) return true;
         }
 
         return false;
@@ -2355,7 +2373,7 @@
         if (!element.matches || !element.matches('[data-message-author-role="user"]')) return false;
         return isComparableTextMatch(
             getComparableMessageText(message.text),
-            getComparableMessageText(normalizeMessageText(element))
+            getComparableMessageText(extractChatGptUserQueryText(element))
         );
     }
 
@@ -2435,6 +2453,7 @@
     }
 
     function getMessageRemoteIndex(message, index) {
+        if (message && typeof message.nativeTocIndex === 'number') return message.nativeTocIndex;
         return message && typeof message.remoteIndex === 'number' ? message.remoteIndex : index;
     }
 
@@ -2583,12 +2602,12 @@
                 source: 'slot-id',
                 liveIndex: null,
                 domIdentityKey,
-                slotText: normalizeMessageText(userElement).slice(0, 80)
+                slotText: extractChatGptUserQueryText(userElement).slice(0, 80)
             };
         }
 
         const remoteText = getComparableMessageText(message.text);
-        const liveText = getComparableMessageText(normalizeMessageText(userElement));
+        const liveText = getComparableMessageText(extractChatGptUserQueryText(userElement));
         const textMatches = isComparableTextMatch(remoteText, liveText);
         if (!textMatches) return null;
 
@@ -2604,7 +2623,7 @@
             source: 'slot-text-id',
             liveIndex: null,
             domIdentityKey: domIdentityKey || '',
-            slotText: normalizeMessageText(userElement).slice(0, 80)
+            slotText: extractChatGptUserQueryText(userElement).slice(0, 80)
         };
     }
 
@@ -2831,7 +2850,7 @@
         const container = getActiveScrollContainer();
         const users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
             .filter((element) => isVisibleElement(element) && isElementInViewport(element, container));
-        const matches = users.filter((element) => isCompatibleNativeTocText(normalizeMessageText(element), text));
+        const matches = users.filter((element) => isCompatibleNativeTocText(extractChatGptUserQueryText(element), text));
         if (!matches.length) return null;
         if (preferActive || matches.length > 1) return getClosestElementToViewportCenter(matches, container);
         return matches[0];
@@ -2846,15 +2865,21 @@
         let entry = getChatGptNativeTocEntryForIndex(nativeIndex);
         if (entry) return entry;
 
-        return getChatGptNativeTocEntries().find((candidate) => (
+        const compatibleEntries = getChatGptNativeTocEntries().filter((candidate) => (
             isCompatibleNativeTocText(message.text, candidate.text)
-        )) || null;
+        ));
+        return compatibleEntries.length === 1 ? compatibleEntries[0] : null;
     }
 
     async function waitForChatGptNativeTocUserQuery(entry, message, timeout) {
         const endAt = Date.now() + timeout;
         while (Date.now() < endAt) {
             await waitForMilliseconds(80);
+            const slot = getChatGptUserSlotElement(entry.index);
+            const slotUser = getChatGptSlotRoleElement(slot, 'user');
+            if (slotUser && isCompatibleNativeTocText(extractChatGptUserQueryText(slotUser), message.text || entry.text)) {
+                return slotUser;
+            }
             const activeIndex = getChatGptActiveNativeTocIndex();
             const candidate = findChatGptNativeTocUserQueryCandidate(
                 message.text || entry.text,
@@ -3295,6 +3320,137 @@
         return currentTop <= threshold + tolerance && nextTop > threshold - tolerance;
     }
 
+    function findMessageIndexByRemoteIndex(messages, remoteIndex) {
+        if (typeof remoteIndex !== 'number') return -1;
+
+        return messages.findIndex((message, index) => (
+            getMessageRemoteIndex(message, index) === remoteIndex ||
+            message.remoteIndex === remoteIndex ||
+            message.nativeTocIndex === remoteIndex ||
+            message.stableOrder === remoteIndex
+        ));
+    }
+
+    function findMessageIndexForLiveChatGptElement(messages, element, fallbackRemoteIndex) {
+        const identityKey = getMessageIdentityKeyFromElement(element);
+        if (identityKey) {
+            const identityIndex = messages.findIndex((message) => getMessageIdentityKeys(message).includes(identityKey));
+            if (identityIndex >= 0) return identityIndex;
+        }
+
+        const remoteIndex = findMessageIndexByRemoteIndex(messages, fallbackRemoteIndex);
+        if (remoteIndex >= 0) return remoteIndex;
+
+        const liveText = extractChatGptUserQueryText(element);
+        const comparable = getComparableMessageText(liveText);
+        if (!comparable) return -1;
+
+        const compatibleIndexes = messages.reduce((indexes, message, index) => {
+            if (isComparableTextMatch(getComparableMessageText(message.text), comparable)) {
+                indexes.push(index);
+            }
+            return indexes;
+        }, []);
+        return compatibleIndexes.length === 1 ? compatibleIndexes[0] : -1;
+    }
+
+    function getChatGptActiveCandidates(messages, container) {
+        const candidates = [];
+        const seen = new Set();
+
+        messages.forEach((message, index) => {
+            const remoteIndex = getMessageRemoteIndex(message, index);
+            const slot = getChatGptUserSlotElement(remoteIndex);
+            if (!slot || !slot.isConnected) return;
+
+            const top = getElementAbsoluteTop(slot, container);
+            if (typeof top !== 'number') return;
+
+            candidates.push({
+                index,
+                top,
+                source: getChatGptSlotSource(slot, remoteIndex) || 'message-slot'
+            });
+        });
+
+        getCurrentTextAlignmentMatches().forEach((match) => {
+            const element = match.element;
+            if (!element || !element.isConnected || !isVisibleElement(element)) return;
+
+            const index = findMessageIndexForLiveChatGptElement(messages, element, match.remoteIndex);
+            if (index < 0) return;
+
+            const top = getElementAbsoluteTop(element, container);
+            if (typeof top !== 'number') return;
+
+            candidates.push({
+                index,
+                top,
+                source: match.source || 'live-text'
+            });
+        });
+
+        messages.forEach((message, index) => {
+            const target = getMessageTarget(message);
+            if (!target || !target.isConnected || !isVisibleElement(target)) return;
+
+            const top = getMessageAbsoluteTop(message, container);
+            if (typeof top !== 'number') return;
+
+            candidates.push({
+                index,
+                top,
+                source: message.anchorSource || 'message-anchor'
+            });
+        });
+
+        return candidates
+            .sort((a, b) => {
+                if (a.top !== b.top) return a.top - b.top;
+                return a.index - b.index;
+            })
+            .filter((candidate) => {
+                if (seen.has(candidate.index)) return false;
+                seen.add(candidate.index);
+                return true;
+            });
+    }
+
+    function findChatGptActiveMessageIndex(messages) {
+        const container = getActiveScrollContainer();
+        const candidates = getChatGptActiveCandidates(messages, container);
+        if (!candidates.length) {
+            const previousIndex = STATE.activeIndex >= 0 ? clampMessageIndex(STATE.activeIndex) : -1;
+            STATE.lastActiveDebug = {
+                mode: previousIndex >= 0 ? 'hold-previous-no-visible-candidates' : 'no-candidates',
+                index: previousIndex
+            };
+            return previousIndex;
+        }
+
+        const threshold = getActiveThreshold(container);
+        let active = candidates[0];
+        for (let i = 0; i < candidates.length; i++) {
+            if (candidates[i].top <= threshold + 12) {
+                active = candidates[i];
+            } else {
+                break;
+            }
+        }
+
+        STATE.lastActiveDebug = {
+            mode: 'chatgpt-visible-candidates',
+            index: active.index,
+            threshold: Math.round(threshold),
+            candidates: candidates.slice(0, 8).map((candidate) => ({
+                index: candidate.index,
+                top: Math.round(candidate.top),
+                source: candidate.source
+            }))
+        };
+        return active.index;
+    }
+
     function scheduleManualActiveRelease(delay) {
         if (STATE.scrollSettleTimer) {
             window.clearTimeout(STATE.scrollSettleTimer);
@@ -3450,13 +3606,9 @@
         if (!messages.length) return -1;
 
         if (ADAPTER.id === 'chatgpt') {
-            const nativeActiveIndex = getChatGptActiveNativeTocIndex();
-            if (nativeActiveIndex !== null) {
-                const messageIndex = messages.findIndex((message, index) => (
-                    (typeof message.nativeTocIndex === 'number' ? message.nativeTocIndex : index) === nativeActiveIndex
-                ));
-                if (messageIndex >= 0) return messageIndex;
-            }
+            const chatGptActiveIndex = findChatGptActiveMessageIndex(messages);
+            if (chatGptActiveIndex >= 0) return chatGptActiveIndex;
+            return STATE.activeIndex >= 0 ? clampMessageIndex(STATE.activeIndex) : 0;
         }
 
         const container = getActiveScrollContainer();
@@ -4072,16 +4224,23 @@
         trimExtraTocItems(list, messages.length);
     }
 
-    function resetTocActiveState(list, previousActiveIndex, total) {
-        if (previousActiveIndex >= 0 && list.children[previousActiveIndex]) {
-            list.children[previousActiveIndex].classList.remove('toc-active');
+    function preserveTocActiveState(list, previousActiveIndex, total) {
+        const preservedIndex = previousActiveIndex >= 0 && previousActiveIndex < total
+            ? previousActiveIndex
+            : -1;
+        Array.from(list.querySelectorAll('.toc-active')).forEach((item) => {
+            item.classList.remove('toc-active');
+        });
+        STATE.activeIndex = preservedIndex;
+        if (preservedIndex >= 0 && list.children[preservedIndex]) {
+            list.children[preservedIndex].classList.add('toc-active');
         }
-
-        STATE.activeIndex = -1;
         if (STATE.clickLockIndex >= total) {
             STATE.clickLockIndex = -1;
         }
-        clearManualActiveIndex();
+        if (STATE.manualActiveIndex >= total) {
+            clearManualActiveIndex();
+        }
     }
 
     function syncTocSearchFilter() {
@@ -4092,7 +4251,7 @@
     }
 
     function finalizeRenderedToc(list, previousActiveIndex, total) {
-        resetTocActiveState(list, previousActiveIndex, total);
+        preserveTocActiveState(list, previousActiveIndex, total);
         syncTocSearchFilter();
         bindScrollSync();
         refreshPositionCache();
@@ -4106,13 +4265,7 @@
             if (STATE.messageListContext !== context) {
                 STATE.messageListContext = context;
                 STATE.messages = [];
-                STATE.stableMessages = [];
-                STATE.stableMessageContext = '';
-            } else if (STATE.messages.length > messages.length) {
-                messages = mergeRemoteAndLiveMessages(STATE.messages, messages);
-                STATE.lastTocSource = `${STATE.lastTocSource || 'scan'}+stable-snapshot`;
             }
-            messages = mergeChatGptStableMessages(messages);
         }
         annotateMessagesWithNativeToc(messages);
         STATE.messages = messages;
