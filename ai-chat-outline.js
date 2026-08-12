@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ai-chat-outline
 // @namespace    http://tampermonkey.net/
-// @version      2.8.3
+// @version      2.8.4
 // @description  Adds a sidebar table of contents to ChatGPT, Gemini and Claude.
 // @author       ArcherEmiya
 // @match        https://gemini.google.com/*
@@ -37,7 +37,7 @@
     }
 
     cleanUpOldVersions();
-    console.log('ai-chat-outline v2.8.3: started');
+    console.log('ai-chat-outline v2.8.4: started');
 
     function getPageWindow() {
         try {
@@ -91,6 +91,7 @@
         positionsDirty: true,
         stableMessages: [],
         stableMessageContext: '',
+        stableNextOrder: 0,
         remoteMessages: [],
         remoteMessageContext: '',
         remoteMessageSource: '',
@@ -112,7 +113,7 @@
         expandedPosition: 'ai-toc-v2_5-expanded-position',
         bubblePosition: 'ai-toc-v2_5-bubble-position',
         collapsed: 'ai-toc-v2_5-collapsed',
-        stableMessagesPrefix: 'ai-toc-v2_8_3-stable-messages'
+        stableMessagesPrefix: 'ai-toc-v2_8_4-stable-messages'
     };
 
     const PATHS = {
@@ -783,6 +784,8 @@
             keys.push(`navigation:${message.navigationId}`);
         }
 
+        if (keys.length) return Array.from(new Set(keys));
+
         const comparable = getComparableMessageText(message.text);
         if (comparable) {
             keys.push(`text:${comparable.slice(0, 240)}`);
@@ -818,6 +821,7 @@
             nativeTocText: message && message.nativeTocText ? message.nativeTocText : '',
             source: message && message.source ? message.source : '',
             anchorSource: message && message.anchorSource ? message.anchorSource : '',
+            stableOrder: message && typeof message.stableOrder === 'number' ? message.stableOrder : undefined,
             observedIndex: message && typeof message.observedIndex === 'number' ? message.observedIndex : fallbackIndex
         };
 
@@ -844,6 +848,7 @@
             nativeTocText: snapshot.nativeTocText,
             source: snapshot.source,
             anchorSource: snapshot.anchorSource,
+            stableOrder: typeof snapshot.stableOrder === 'number' ? snapshot.stableOrder : index,
             observedIndex: typeof snapshot.observedIndex === 'number' ? snapshot.observedIndex : index
         };
 
@@ -885,6 +890,7 @@
                     remoteIndex: typeof message.remoteIndex === 'number' ? message.remoteIndex : undefined,
                     nativeTocIndex: typeof message.nativeTocIndex === 'number' ? message.nativeTocIndex : undefined,
                     observedTop: typeof message.observedTop === 'number' ? message.observedTop : undefined,
+                    stableOrder: typeof message.stableOrder === 'number' ? message.stableOrder : index,
                     observedIndex: typeof message.observedIndex === 'number' ? message.observedIndex : index
                 }));
         } catch (error) {
@@ -920,6 +926,11 @@
         if (typeof incoming.remoteIndex === 'number') existing.remoteIndex = incoming.remoteIndex;
         if (typeof incoming.nativeTocIndex === 'number') existing.nativeTocIndex = incoming.nativeTocIndex;
         if (typeof incoming.observedTop === 'number') existing.observedTop = incoming.observedTop;
+        if (typeof incoming.stableOrder === 'number') {
+            existing.stableOrder = typeof existing.stableOrder === 'number'
+                ? Math.min(existing.stableOrder, incoming.stableOrder)
+                : incoming.stableOrder;
+        }
         if (typeof incoming.observedIndex === 'number') {
             existing.observedIndex = typeof existing.observedIndex === 'number'
                 ? Math.min(existing.observedIndex, incoming.observedIndex)
@@ -935,11 +946,34 @@
     }
 
     function getStableMessageSortValue(message) {
-        if (message && typeof message.remoteIndex === 'number') return message.remoteIndex * 1000000;
-        if (message && typeof message.nativeTocIndex === 'number') return message.nativeTocIndex * 1000000 + 1000;
-        if (message && typeof message.observedTop === 'number') return message.observedTop;
-        if (message && typeof message.observedIndex === 'number') return message.observedIndex * 1000000 + 500000;
+        if (message && typeof message.stableOrder === 'number') return message.stableOrder;
+        if (message && typeof message.remoteIndex === 'number') return message.remoteIndex;
+        if (message && typeof message.nativeTocIndex === 'number') return message.nativeTocIndex;
+        if (message && typeof message.observedIndex === 'number') return message.observedIndex;
         return Number.MAX_SAFE_INTEGER;
+    }
+
+    function getAuthoritativeMessageOrder(message) {
+        if (message && typeof message.remoteIndex === 'number') return message.remoteIndex;
+        if (message && typeof message.nativeTocIndex === 'number') return message.nativeTocIndex;
+        if (message && typeof message.stableOrder === 'number') return message.stableOrder;
+        return;
+    }
+
+    function ensureStableMessageOrder(message, fallback, allowFallbackOrder) {
+        if (typeof message.stableOrder === 'number') return;
+
+        const authoritativeOrder = getAuthoritativeMessageOrder(message);
+        if (typeof authoritativeOrder === 'number' && authoritativeOrder >= 0) {
+            message.stableOrder = authoritativeOrder;
+            STATE.stableNextOrder = Math.max(STATE.stableNextOrder, authoritativeOrder + 1);
+            return;
+        }
+
+        message.stableOrder = allowFallbackOrder && typeof fallback === 'number'
+            ? fallback
+            : STATE.stableNextOrder;
+        STATE.stableNextOrder += 1;
     }
 
     function mergeChatGptStableMessages(currentMessages) {
@@ -947,11 +981,17 @@
         if (STATE.stableMessageContext !== context) {
             STATE.stableMessageContext = context;
             STATE.stableMessages = readStoredStableMessages(context);
+            STATE.stableNextOrder = STATE.stableMessages.reduce((maxOrder, message, index) => {
+                const order = typeof message.stableOrder === 'number' ? message.stableOrder : index;
+                message.stableOrder = order;
+                return Math.max(maxOrder, order + 1);
+            }, 0);
         }
 
         const merged = [];
         const byKey = new Map();
-        const addMessage = (message, index) => {
+        const hadStableMessages = STATE.stableMessages.length > 0;
+        const addMessage = (message, index, allowFallbackOrder) => {
             const snapshot = snapshotMessageForStableCache(message, index);
             if (!snapshot.text) return;
 
@@ -964,21 +1004,23 @@
 
             if (!existing) {
                 existing = snapshot;
+                ensureStableMessageOrder(existing, index, allowFallbackOrder);
                 merged.push(existing);
             } else {
                 mergeStableMessage(existing, snapshot);
+                ensureStableMessageOrder(existing, index, allowFallbackOrder);
             }
 
             getStableMessageKeys(existing).forEach((key) => byKey.set(key, existing));
         };
 
-        STATE.stableMessages.forEach(addMessage);
-        currentMessages.forEach(addMessage);
+        STATE.stableMessages.forEach((message, index) => addMessage(message, index, true));
+        currentMessages.forEach((message, index) => addMessage(message, index, !hadStableMessages));
 
         merged.sort((a, b) => {
             const diff = getStableMessageSortValue(a) - getStableMessageSortValue(b);
             if (diff) return diff;
-            return (a.text || '').localeCompare(b.text || '');
+            return (a.observedIndex || 0) - (b.observedIndex || 0);
         });
 
         STATE.stableMessages = merged.map((message, index) => snapshotMessageForStableCache(message, index));
@@ -1122,7 +1164,7 @@
             }));
 
             return {
-                version: '2.8.3',
+                version: '2.8.4',
                 conversationId: getChatGptConversationId(),
                 url: window.location.href,
                 adapterId: ADAPTER.id,
@@ -1133,6 +1175,7 @@
                 tocMessages: STATE.messages.length,
                 stableMessages: STATE.stableMessages.length,
                 stableMessageContext: STATE.stableMessageContext,
+                stableNextOrder: STATE.stableNextOrder,
                 remoteMessages: STATE.remoteMessages.length,
                 remoteMessageContext: STATE.remoteMessageContext,
                 remoteMessageSource: STATE.remoteMessageSource,
@@ -1161,9 +1204,9 @@
             };
         };
         window.__aiTocDebug = debugFn;
-        window.__aiTocVersion = '2.8.3';
+        window.__aiTocVersion = '2.8.4';
         pageWindow.__aiTocDebug = debugFn;
-        pageWindow.__aiTocVersion = '2.8.3';
+        pageWindow.__aiTocVersion = '2.8.4';
     }
 
     function collectMessagesFromAdapter(adapter) {
