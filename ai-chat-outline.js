@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ai-chat-outline
 // @namespace    http://tampermonkey.net/
-// @version      2.8.5
+// @version      2.8.6
 // @description  Adds a sidebar table of contents to ChatGPT, Gemini and Claude.
 // @author       ArcherEmiya
 // @match        https://gemini.google.com/*
@@ -37,7 +37,7 @@
     }
 
     cleanUpOldVersions();
-    console.log('ai-chat-outline v2.8.5: started');
+    console.log('ai-chat-outline v2.8.6: started');
 
     function getPageWindow() {
         try {
@@ -100,6 +100,23 @@
         remoteFetchInFlight: false,
         remoteFetchStatus: '',
         conversationInterceptorInstalled: false,
+        claudeCatalogMessages: [],
+        claudeCatalogContext: '',
+        claudeCatalogSource: '',
+        claudeRemoteMessages: [],
+        claudeRemoteContext: '',
+        claudeRemoteSource: '',
+        claudeRemoteStatus: '',
+        claudeLastConversationUrl: '',
+        claudeObservedUrls: [],
+        claudeHydrateUrl: '',
+        claudeResourceObserver: null,
+        claudeConversationInterceptorInstalled: false,
+        claudeDirectDomMessages: 0,
+        claudeDocumentUserMessages: 0,
+        claudeDirectDomSamples: [],
+        claudeDirectScrollContainer: '',
+        claudeDirectScrollStats: null,
         lastTocSource: '',
         messageListContext: '',
         lastTocClick: null,
@@ -463,11 +480,13 @@
     function getMessageIdentityKeyFromElement(element) {
         if (!element || !element.getAttribute) return '';
 
-        const directId = element.getAttribute('data-message-id');
+        const directId = element.getAttribute('data-message-id') || element.getAttribute('data-message-uuid');
         if (directId) return `message:${directId}`;
 
-        const closest = element.closest ? element.closest('[data-message-id]') : null;
-        const closestId = closest ? closest.getAttribute('data-message-id') : '';
+        const closest = element.closest ? element.closest('[data-message-id], [data-message-uuid]') : null;
+        const closestId = closest
+            ? closest.getAttribute('data-message-id') || closest.getAttribute('data-message-uuid') || ''
+            : '';
         return closestId ? `message:${closestId}` : '';
     }
 
@@ -1166,7 +1185,7 @@
             }, new Map()).values()).filter((group) => group.length > 1);
 
             return {
-                version: '2.8.5',
+                version: '2.8.6',
                 conversationId: getChatGptConversationId(),
                 url: window.location.href,
                 adapterId: ADAPTER.id,
@@ -1190,6 +1209,24 @@
                 remoteFetchContext: STATE.remoteFetchContext,
                 remoteFetchInFlight: STATE.remoteFetchInFlight,
                 remoteFetchStatus: STATE.remoteFetchStatus,
+                claudeConversationId: getClaudeConversationId(),
+                claudeCatalogMessages: STATE.claudeCatalogMessages.length,
+                claudeCatalogContext: STATE.claudeCatalogContext,
+                claudeCatalogSource: STATE.claudeCatalogSource,
+                claudeRemoteMessages: STATE.claudeRemoteMessages.length,
+                claudeRemoteContext: STATE.claudeRemoteContext,
+                claudeRemoteSource: STATE.claudeRemoteSource,
+                claudeRemoteStatus: STATE.claudeRemoteStatus,
+                claudeLastConversationUrl: STATE.claudeLastConversationUrl,
+                claudeObservedUrls: STATE.claudeObservedUrls.slice(),
+                claudeHydrateUrl: STATE.claudeHydrateUrl,
+                claudeResourceObserverInstalled: !!STATE.claudeResourceObserver,
+                claudeInterceptorInstalled: STATE.claudeConversationInterceptorInstalled,
+                claudeDirectDomMessages: STATE.claudeDirectDomMessages,
+                claudeDocumentUserMessages: STATE.claudeDocumentUserMessages,
+                claudeDirectDomSamples: STATE.claudeDirectDomSamples.slice(),
+                claudeDirectScrollContainer: STATE.claudeDirectScrollContainer,
+                claudeDirectScrollStats: STATE.claudeDirectScrollStats,
                 tocSource: STATE.lastTocSource,
                 interceptorInstalled: STATE.conversationInterceptorInstalled,
                 exactTextOrderAnchors: STATE.messages.filter((message) => message.anchorSource === 'exact-text-order').length,
@@ -1214,9 +1251,9 @@
             };
         };
         window.__aiTocDebug = debugFn;
-        window.__aiTocVersion = '2.8.5';
+        window.__aiTocVersion = '2.8.6';
         pageWindow.__aiTocDebug = debugFn;
-        pageWindow.__aiTocVersion = '2.8.5';
+        pageWindow.__aiTocVersion = '2.8.6';
     }
 
     function collectMessagesFromAdapter(adapter) {
@@ -1303,6 +1340,106 @@
         return container.querySelector('.font-user-message, [class*="font-user-message"]') || container;
     }
 
+    function isClaudeScrollableContainer(element) {
+        if (!element) return false;
+        const overflowY = window.getComputedStyle(element).overflowY;
+        const allowsScroll = overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay' ||
+            element.getAttribute('data-autoscroll-container') === 'true';
+        return allowsScroll && element.scrollHeight > element.clientHeight + 4;
+    }
+
+    function findClaudeScrollContainer() {
+        const candidates = Array.from(document.querySelectorAll('.font-claude-response, [data-testid="user-message"]'));
+        let current = candidates.find((element) => !element.closest('#ai-toc-v2_2')) || null;
+        while (current && current !== document.body) {
+            if (isClaudeScrollableContainer(current)) return current;
+            current = current.parentElement;
+        }
+
+        const fallbacks = [
+            '[data-autoscroll-container="true"]',
+            '#main-content .overflow-y-scroll',
+            '#root .overflow-y-auto.overflow-x-hidden'
+        ];
+        for (let i = 0; i < fallbacks.length; i++) {
+            const element = document.querySelector(fallbacks[i]);
+            if (isClaudeScrollableContainer(element)) return element;
+        }
+        return null;
+    }
+
+    function getClaudeReferenceScrollContainer() {
+        const internal = findClaudeScrollContainer();
+        const pageScroller = document.scrollingElement;
+        const internalRange = internal ? internal.scrollHeight - internal.clientHeight : -1;
+        const pageRange = pageScroller ? pageScroller.scrollHeight - pageScroller.clientHeight : -1;
+        if (
+            internal &&
+            pageScroller &&
+            pageRange > internalRange + 100 &&
+            pageScroller.scrollHeight > pageScroller.clientHeight + 4
+        ) {
+            return pageScroller;
+        }
+        if (internal) return internal;
+        if (pageScroller && pageScroller.scrollHeight > pageScroller.clientHeight + 4) return pageScroller;
+        return null;
+    }
+
+    function describeClaudeScrollContainer(element) {
+        if (!element) return '';
+        const id = element.id ? `#${element.id}` : '';
+        const classes = typeof element.className === 'string'
+            ? element.className.trim().split(/\s+/).slice(0, 5).join('.')
+            : '';
+        return `${element.tagName || ''}${id}${classes ? `.${classes}` : ''}`;
+    }
+
+    function collectClaudeDirectDomMessages() {
+        const internal = findClaudeScrollContainer();
+        const root = getClaudeReferenceScrollContainer() || document;
+        const elements = Array.from(root.querySelectorAll('[data-testid="user-message"]'))
+            .filter((element) => !isClaudeComposerElement(element) && !element.closest('#ai-toc-v2_2'));
+        const messages = elements.reduce((result, element, observedIndex) => {
+            const text = normalizeMessageText(element);
+            if (!text) return result;
+            const messageId = element.getAttribute('data-message-id') ||
+                element.getAttribute('data-message-uuid') || '';
+            const identityKeys = createMessageIdentityKeys(messageId);
+            result.push({
+                container: element,
+                anchor: element,
+                text,
+                identityKey: identityKeys[0] || '',
+                identityKeys,
+                observedIndex,
+                source: 'claude-direct-dom'
+            });
+            return result;
+        }, []);
+
+        STATE.claudeDirectDomMessages = messages.length;
+        STATE.claudeDocumentUserMessages = document.querySelectorAll('[data-testid="user-message"]').length;
+        STATE.claudeDirectDomSamples = messages.slice(0, 12).map((message, index) => ({
+            index,
+            text: message.text.slice(0, 120),
+            identityKeys: getMessageIdentityKeys(message)
+        }));
+        STATE.claudeDirectScrollContainer = describeClaudeScrollContainer(root === document ? null : root);
+        STATE.claudeDirectScrollStats = {
+            selected: root === document ? 'document' : describeClaudeScrollContainer(root),
+            selectedScrollTop: root === document ? 0 : Math.round(root.scrollTop || 0),
+            selectedScrollHeight: root === document ? 0 : Math.round(root.scrollHeight || 0),
+            selectedClientHeight: root === document ? 0 : Math.round(root.clientHeight || 0),
+            internal: describeClaudeScrollContainer(internal),
+            internalRange: internal ? Math.round(internal.scrollHeight - internal.clientHeight) : -1,
+            pageRange: document.scrollingElement
+                ? Math.round(document.scrollingElement.scrollHeight - document.scrollingElement.clientHeight)
+                : -1
+        };
+        return messages;
+    }
+
     function isClaudeComposerElement(element) {
         if (!element || !element.closest) return false;
         return !!element.closest('textarea, [contenteditable="true"], form, [data-testid*="composer"], [data-testid*="input"]');
@@ -1318,6 +1455,489 @@
         if (fontMessage) return fontMessage;
 
         return resolveGroupedMessageContainer(line, CLAUDE_USER_SELECTOR);
+    }
+
+    function getClaudeConversationIdFromText(text) {
+        if (!text) return '';
+        const patterns = [
+            /\/chat\/([a-f0-9-]{20,})/i,
+            /\/api\/(?:organizations\/[^/]+\/)?chat_conversations\/([a-f0-9-]{20,})/i,
+            /\/api\/[^?#]*\/conversations\/([a-f0-9-]{20,})/i,
+            /[?&](?:conversation_id|conversation_uuid|chat_conversation_id)=([a-f0-9-]{20,})/i
+        ];
+        for (let i = 0; i < patterns.length; i++) {
+            const match = String(text).match(patterns[i]);
+            if (match && match[1]) return match[1];
+        }
+        return '';
+    }
+
+    function getClaudeConversationId() {
+        if (!window.location.hostname.includes('claude.ai')) return '';
+        return getClaudeConversationIdFromText(window.location.href);
+    }
+
+    function getClaudeMessageContext() {
+        const conversationId = getClaudeConversationId();
+        return conversationId
+            ? `claude:${conversationId}`
+            : `${window.location.hostname}${window.location.pathname}${window.location.search}`;
+    }
+
+    function getClaudeMessageRole(message) {
+        if (!message || typeof message !== 'object') return '';
+        const sender = message.sender;
+        if (typeof sender === 'string') return sender.toLowerCase();
+        if (sender && typeof sender === 'object') {
+            const senderRole = sender.role || sender.type || sender.name;
+            if (senderRole) return String(senderRole).toLowerCase();
+        }
+        return String(message.role || message.author_role || message.authorRole || '').toLowerCase();
+    }
+
+    function flattenClaudeMessageContent(value) {
+        if (typeof value === 'string') return value;
+        if (!value) return '';
+        if (Array.isArray(value)) {
+            return value.map(flattenClaudeMessageContent).filter(Boolean).join(' ');
+        }
+        if (typeof value !== 'object') return '';
+        if (typeof value.text === 'string') return value.text;
+        if (typeof value.value === 'string' && /text/i.test(String(value.type || ''))) return value.value;
+        if (Array.isArray(value.content)) return flattenClaudeMessageContent(value.content);
+        if (Array.isArray(value.parts)) return flattenClaudeMessageContent(value.parts);
+        if (/image/i.test(String(value.type || value.content_type || ''))) return '[image]';
+        return '';
+    }
+
+    function getClaudeConversationMessageText(message) {
+        if (!message || typeof message !== 'object') return '';
+        if (typeof message.text === 'string' && message.text.trim()) return normalizePlainText(message.text);
+        if (typeof message.prompt === 'string' && message.prompt.trim()) return normalizePlainText(message.prompt);
+        return normalizePlainText(flattenClaudeMessageContent(message.content || message.parts));
+    }
+
+    function findClaudeConversationMessageArray(data) {
+        const candidates = [];
+        const seen = new WeakSet();
+
+        function visit(value, depth, key) {
+            if (!value || typeof value !== 'object' || depth > 5) return;
+            if (seen.has(value)) return;
+            seen.add(value);
+
+            if (Array.isArray(value)) {
+                const roleCount = value.reduce((count, item) => {
+                    const role = getClaudeMessageRole(item);
+                    return count + (/^(human|user|assistant|claude)$/.test(role) ? 1 : 0);
+                }, 0);
+                if (value.length && roleCount) {
+                    const keyBonus = /chat_messages|messages/i.test(key || '') ? 1000 : 0;
+                    candidates.push({ value, score: keyBonus + roleCount * 10 + value.length });
+                }
+                value.forEach((item) => visit(item, depth + 1, key));
+                return;
+            }
+
+            Object.keys(value).forEach((childKey) => {
+                visit(value[childKey], depth + 1, childKey);
+            });
+        }
+
+        visit(data, 0, 'root');
+        candidates.sort((a, b) => b.score - a.score);
+        return candidates.length ? candidates[0].value : [];
+    }
+
+    function extractClaudeUserMessages(data) {
+        const messages = findClaudeConversationMessageArray(data);
+        return messages.reduce((result, message, messageIndex) => {
+            const role = getClaudeMessageRole(message);
+            if (role !== 'human' && role !== 'user') return result;
+            if (message.deleted_at || message.is_deleted || message.hidden === true) return result;
+
+            const text = getClaudeConversationMessageText(message);
+            if (!text) return result;
+            const messageId = message.uuid || message.id || message.message_uuid || message.messageId || '';
+            const identityKeys = createMessageIdentityKeys(messageId);
+            result.push({
+                container: null,
+                anchor: null,
+                text,
+                identityKey: identityKeys[0] || '',
+                identityKeys,
+                remoteIndex: result.length,
+                source: 'claude-conversation',
+                observedIndex: messageIndex
+            });
+            return result;
+        }, []);
+    }
+
+    function applyClaudeConversationData(data, source, contextOverride) {
+        const messages = extractClaudeUserMessages(data);
+        if (!messages.length) {
+            if (!STATE.claudeRemoteMessages.length) STATE.claudeRemoteStatus = `${source}:empty`;
+            return false;
+        }
+
+        const context = contextOverride || getClaudeMessageContext();
+        const currentContext = getClaudeMessageContext();
+        if (context !== currentContext) {
+            STATE.claudeRemoteStatus = `${source}:ignored-other-conversation`;
+            return false;
+        }
+        STATE.claudeRemoteMessages = messages;
+        STATE.claudeRemoteContext = context;
+        STATE.claudeRemoteSource = source;
+        STATE.claudeRemoteStatus = `${source}:ok:${messages.length}`;
+        scheduleScan(0);
+        return true;
+    }
+
+    function isClaudeConversationResponseUrl(url) {
+        if (!url) return false;
+        const value = String(url);
+        if (/\/(?:completion|retry|feedback)(?:\/|\?|$)/i.test(value)) return false;
+        if (/\/api\/(?:organizations\/[^/]+\/)?chat_conversations\/[a-f0-9-]{20,}(?:\/[^?#]*)?(?:[?#]|$)/i.test(value)) {
+            return true;
+        }
+        return /\/api\/[^?#]*(?:chat_messages|messages|conversations)[^?#]*(?:\?|$)/i.test(value)
+            && !!getClaudeConversationIdFromText(value);
+    }
+
+    function recordClaudeObservedUrl(url) {
+        if (!url || !window.location.hostname.includes('claude.ai')) return;
+
+        let parsed;
+        try {
+            parsed = new URL(String(url), window.location.href);
+        } catch (error) {
+            return;
+        }
+        if (parsed.origin !== window.location.origin || !parsed.pathname.startsWith('/api/')) return;
+
+        const currentConversationId = getClaudeConversationId();
+        const value = `${parsed.pathname}${parsed.search}`;
+        const isConversationResource = /chat_conversations|conversation|chat_messages|messages/i.test(value);
+        if (!isConversationResource && (!currentConversationId || !value.includes(currentConversationId))) return;
+
+        const absoluteUrl = parsed.href;
+        const existingIndex = STATE.claudeObservedUrls.indexOf(absoluteUrl);
+        if (existingIndex >= 0) STATE.claudeObservedUrls.splice(existingIndex, 1);
+        STATE.claudeObservedUrls.push(absoluteUrl);
+        if (STATE.claudeObservedUrls.length > 30) STATE.claudeObservedUrls.splice(0, STATE.claudeObservedUrls.length - 30);
+        if (/chat_conversations/i.test(value)) STATE.claudeLastConversationUrl = absoluteUrl;
+    }
+
+    function findClaudeObservedConversationUrl() {
+        const performanceApi = window.performance;
+        if (performanceApi && typeof performanceApi.getEntriesByType === 'function') {
+            performanceApi.getEntriesByType('resource').forEach((entry) => {
+                recordClaudeObservedUrl(entry && entry.name);
+            });
+        }
+
+        const conversationId = getClaudeConversationId();
+        if (!conversationId) return '';
+        for (let i = STATE.claudeObservedUrls.length - 1; i >= 0; i--) {
+            const url = STATE.claudeObservedUrls[i];
+            if (getClaudeConversationIdFromText(url) === conversationId && isClaudeConversationResponseUrl(url)) {
+                return url;
+            }
+        }
+        return '';
+    }
+
+    function hydrateClaudeConversationFromObservedResource() {
+        if (!window.location.hostname.includes('claude.ai')) return;
+        const context = getClaudeMessageContext();
+        if (STATE.claudeRemoteContext === context && STATE.claudeRemoteMessages.length) return;
+
+        const url = findClaudeObservedConversationUrl();
+        if (!url || STATE.claudeHydrateUrl === url) return;
+        STATE.claudeHydrateUrl = url;
+        STATE.claudeRemoteStatus = 'observed-resource:loading';
+
+        const pageWindow = getPageWindow();
+        const fetchFn = pageWindow && typeof pageWindow.fetch === 'function'
+            ? pageWindow.fetch.bind(pageWindow)
+            : window.fetch.bind(window);
+        fetchFn(url, {
+            credentials: 'include',
+            headers: { accept: 'application/json' }
+        })
+            .then((response) => {
+                if (!response.ok) throw new Error(`http-${response.status}`);
+                return response.json();
+            })
+            .then((data) => {
+                applyClaudeConversationData(data, 'observed-resource', context);
+            })
+            .catch((error) => {
+                STATE.claudeRemoteStatus = `observed-resource:${error && error.message ? error.message : 'read-error'}`;
+            });
+    }
+
+    function installClaudeResourceObserver() {
+        if (!window.location.hostname.includes('claude.ai')) return;
+        if (STATE.claudeResourceObserver) return;
+
+        const inspectResources = (entries) => {
+            entries.forEach((entry) => recordClaudeObservedUrl(entry && entry.name));
+            hydrateClaudeConversationFromObservedResource();
+        };
+
+        const performanceApi = window.performance;
+        if (performanceApi && typeof performanceApi.getEntriesByType === 'function') {
+            inspectResources(performanceApi.getEntriesByType('resource'));
+        }
+
+        const Observer = window.PerformanceObserver;
+        if (typeof Observer !== 'function') return;
+        try {
+            STATE.claudeResourceObserver = new Observer((list) => {
+                inspectResources(list.getEntries());
+            });
+            STATE.claudeResourceObserver.observe({ type: 'resource', buffered: true });
+        } catch (error) {
+            STATE.claudeResourceObserver = null;
+        }
+    }
+
+    function readClaudeConversationResponse(response, requestedUrl, source) {
+        const responseUrl = response && response.url ? response.url : requestedUrl;
+        if (responseUrl && /chat_conversations/i.test(String(responseUrl))) {
+            STATE.claudeLastConversationUrl = String(responseUrl);
+        }
+        if (!response || !isClaudeConversationResponseUrl(responseUrl)) return;
+        const conversationId = getClaudeConversationIdFromText(responseUrl);
+        const context = conversationId ? `claude:${conversationId}` : getClaudeMessageContext();
+        response.clone().json()
+            .then((data) => applyClaudeConversationData(data, source, context))
+            .catch(() => {
+                STATE.claudeRemoteStatus = `${source}:read-error`;
+            });
+    }
+
+    function installClaudeConversationInterceptors() {
+        if (!window.location.hostname.includes('claude.ai')) return;
+        if (STATE.claudeConversationInterceptorInstalled) return;
+        STATE.claudeConversationInterceptorInstalled = true;
+
+        const pageWindow = getPageWindow();
+        const originalFetch = pageWindow.fetch;
+        if (typeof originalFetch === 'function') {
+            pageWindow.fetch = function interceptedClaudeFetch() {
+                const input = arguments[0];
+                const requestedUrl = typeof input === 'string'
+                    ? input
+                    : input && input.url ? input.url : '';
+                recordClaudeObservedUrl(requestedUrl);
+                if (requestedUrl && /chat_conversations/i.test(String(requestedUrl))) {
+                    STATE.claudeLastConversationUrl = String(requestedUrl);
+                }
+                const result = originalFetch.apply(this, arguments);
+                Promise.resolve(result)
+                    .then((response) => readClaudeConversationResponse(response, requestedUrl, 'page-fetch'))
+                    .catch(() => {});
+                return result;
+            };
+        }
+
+        const OriginalXHR = pageWindow.XMLHttpRequest;
+        if (typeof OriginalXHR === 'function' && OriginalXHR.prototype && !OriginalXHR.prototype.__aiTocClaudeConversationPatched) {
+            const xhrProto = OriginalXHR.prototype;
+            const originalOpen = xhrProto.open;
+            const originalSend = xhrProto.send;
+            xhrProto.open = function interceptedClaudeOpen(method, url) {
+                this.__aiTocClaudeConversationUrl = typeof url === 'string' ? url : String(url || '');
+                recordClaudeObservedUrl(this.__aiTocClaudeConversationUrl);
+                return originalOpen.apply(this, arguments);
+            };
+            xhrProto.send = function interceptedClaudeSend() {
+                if (!this.__aiTocClaudeConversationListener) {
+                    this.__aiTocClaudeConversationListener = true;
+                    this.addEventListener('load', () => {
+                        const requestUrl = this.__aiTocClaudeConversationUrl || '';
+                        if (requestUrl && /chat_conversations/i.test(requestUrl)) {
+                            STATE.claudeLastConversationUrl = requestUrl;
+                        }
+                        if (!isClaudeConversationResponseUrl(requestUrl)) return;
+                        try {
+                            const data = JSON.parse(this.responseText);
+                            const conversationId = getClaudeConversationIdFromText(requestUrl);
+                            const context = conversationId ? `claude:${conversationId}` : getClaudeMessageContext();
+                            applyClaudeConversationData(data, 'page-xhr', context);
+                        } catch (error) {
+                            STATE.claudeRemoteStatus = 'page-xhr:read-error';
+                        }
+                    });
+                }
+                return originalSend.apply(this, arguments);
+            };
+            xhrProto.__aiTocClaudeConversationPatched = true;
+        }
+    }
+
+    function replaceClaudeCatalog(messages, context, source) {
+        STATE.claudeCatalogMessages = snapshotChatGptCatalogMessages(messages);
+        STATE.claudeCatalogContext = context;
+        STATE.claudeCatalogSource = source;
+    }
+
+    function areClaudeCatalogMessagesEqual(left, right) {
+        if (!left || !right) return false;
+        const leftKeys = getMessageIdentityKeys(left);
+        const rightKeys = getMessageIdentityKeys(right);
+        if (leftKeys.length && rightKeys.length && leftKeys.some((key) => rightKeys.includes(key))) return true;
+        const leftText = getComparableMessageText(left.text);
+        const rightText = getComparableMessageText(right.text);
+        return !!leftText && leftText === rightText;
+    }
+
+    function findClaudeMessageSequence(haystack, needle) {
+        if (!needle.length || needle.length > haystack.length) return -1;
+        for (let start = 0; start <= haystack.length - needle.length; start++) {
+            let matches = true;
+            for (let index = 0; index < needle.length; index++) {
+                if (!areClaudeCatalogMessagesEqual(haystack[start + index], needle[index])) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) return start;
+        }
+        return -1;
+    }
+
+    function getClaudeSequenceOverlap(left, right) {
+        const maxOverlap = Math.min(left.length, right.length);
+        for (let length = maxOverlap; length > 0; length--) {
+            let matches = true;
+            for (let index = 0; index < length; index++) {
+                if (!areClaudeCatalogMessagesEqual(left[left.length - length + index], right[index])) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) return length;
+        }
+        return 0;
+    }
+
+    function updateClaudeCatalogAnchors(catalog, batch, startIndex) {
+        const updated = catalog.map((message, index) => snapshotChatGptCatalogMessage(message, index));
+        batch.forEach((message, batchIndex) => {
+            const catalogIndex = startIndex + batchIndex;
+            if (catalogIndex < 0 || catalogIndex >= updated.length) return;
+            const snapshot = snapshotChatGptCatalogMessage(message, catalogIndex);
+            snapshot.remoteIndex = catalogIndex;
+            updated[catalogIndex] = snapshot;
+        });
+        return updated;
+    }
+
+    function mergeClaudeDirectDomCatalog(directMessages, context) {
+        if (!directMessages.length) return;
+        if (STATE.claudeCatalogContext !== context || !STATE.claudeCatalogMessages.length) {
+            replaceClaudeCatalog(directMessages, context, 'claude-direct-dom');
+            return;
+        }
+
+        const catalog = STATE.claudeCatalogMessages;
+        const batch = snapshotChatGptCatalogMessages(directMessages);
+        const batchInCatalog = findClaudeMessageSequence(catalog, batch);
+        if (batchInCatalog >= 0) {
+            STATE.claudeCatalogMessages = updateClaudeCatalogAnchors(catalog, batch, batchInCatalog);
+            STATE.claudeCatalogSource = 'claude-direct-dom-retained';
+            return;
+        }
+
+        const catalogInBatch = findClaudeMessageSequence(batch, catalog);
+        if (catalogInBatch >= 0) {
+            replaceClaudeCatalog(batch, context, 'claude-direct-dom-expanded');
+            return;
+        }
+
+        const appendOverlap = getClaudeSequenceOverlap(catalog, batch);
+        if (appendOverlap > 0) {
+            replaceClaudeCatalog(
+                [...catalog, ...batch.slice(appendOverlap)],
+                context,
+                'claude-direct-dom-appended'
+            );
+            return;
+        }
+
+        const prependOverlap = getClaudeSequenceOverlap(batch, catalog);
+        if (prependOverlap > 0) {
+            replaceClaudeCatalog(
+                [...batch.slice(0, batch.length - prependOverlap), ...catalog],
+                context,
+                'claude-direct-dom-prepended'
+            );
+            return;
+        }
+
+        STATE.claudeCatalogSource = 'claude-direct-dom-retained-no-overlap';
+    }
+
+    function bindLiveMessagesToClaudeCatalog(catalogMessages, liveMessages) {
+        const liveByIdentity = new Map();
+        const liveByText = new Map();
+        const catalogTextCounts = new Map();
+        const usedLiveMessages = new Set();
+
+        catalogMessages.forEach((message) => {
+            const comparable = getComparableMessageText(message.text);
+            if (comparable) catalogTextCounts.set(comparable, (catalogTextCounts.get(comparable) || 0) + 1);
+        });
+        liveMessages.forEach((message) => {
+            getMessageIdentityKeys(message).forEach((key) => {
+                if (!liveByIdentity.has(key)) liveByIdentity.set(key, message);
+            });
+            const comparable = getComparableMessageText(message.text);
+            if (comparable) {
+                const group = liveByText.get(comparable) || [];
+                group.push(message);
+                liveByText.set(comparable, group);
+            }
+        });
+
+        const rebound = catalogMessages.map((catalogMessage, index) => {
+            const snapshot = snapshotChatGptCatalogMessage(catalogMessage, index);
+            let liveMessage = null;
+            const identityKeys = getMessageIdentityKeys(snapshot);
+            for (let i = 0; i < identityKeys.length; i++) {
+                const candidate = liveByIdentity.get(identityKeys[i]);
+                if (candidate && !usedLiveMessages.has(candidate)) {
+                    liveMessage = candidate;
+                    break;
+                }
+            }
+
+            if (!liveMessage) {
+                const comparable = getComparableMessageText(snapshot.text);
+                const candidates = comparable ? liveByText.get(comparable) || [] : [];
+                if (catalogTextCounts.get(comparable) === 1 && candidates.length === 1) {
+                    liveMessage = candidates[0];
+                }
+            }
+            if (!liveMessage || usedLiveMessages.has(liveMessage)) return snapshot;
+            usedLiveMessages.add(liveMessage);
+            snapshot.anchor = liveMessage.anchor && liveMessage.anchor.isConnected ? liveMessage.anchor : null;
+            snapshot.container = liveMessage.container && liveMessage.container.isConnected ? liveMessage.container : null;
+            snapshot.identityKeys = createMessageIdentityKeys.apply(
+                null,
+                getMessageIdentityKeys(snapshot).concat(getMessageIdentityKeys(liveMessage))
+            );
+            snapshot.identityKey = snapshot.identityKeys[0] || '';
+            snapshot.anchorSource = 'claude-live-anchor';
+            return snapshot;
+        });
+        STATE.claudeCatalogMessages = snapshotChatGptCatalogMessages(rebound);
+        return rebound;
     }
 
     const SITE_ADAPTERS = {
@@ -1440,6 +2060,23 @@
             matches() {
                 return window.location.hostname.includes('claude.ai');
             },
+            beforeCollect() {
+                const context = getClaudeMessageContext();
+                if (STATE.claudeCatalogContext && STATE.claudeCatalogContext !== context) {
+                    STATE.claudeCatalogMessages = [];
+                    STATE.claudeCatalogContext = '';
+                    STATE.claudeCatalogSource = '';
+                    STATE.claudeObservedUrls = [];
+                    STATE.claudeHydrateUrl = '';
+                }
+                if (STATE.claudeRemoteContext && STATE.claudeRemoteContext !== context) {
+                    STATE.claudeRemoteMessages = [];
+                    STATE.claudeRemoteContext = '';
+                    STATE.claudeRemoteSource = '';
+                    STATE.claudeRemoteStatus = '';
+                }
+                hydrateClaudeConversationFromObservedResource();
+            },
             resolveMessageContainer(line) {
                 return resolveClaudeMessageContainer(line);
             },
@@ -1451,10 +2088,38 @@
                 return text || extractImageLabel(container || line);
             },
             getScrollReferenceTargets(messages) {
-                return getDefaultScrollReferenceTargets(messages, this.selector);
+                const directMessages = collectClaudeDirectDomMessages();
+                return getDefaultScrollReferenceTargets(directMessages.length ? directMessages : messages, '[data-testid="user-message"]');
             },
             collectExtraMessages() {
                 return [];
+            },
+            mergeMessages(liveMessages) {
+                const context = getClaudeMessageContext();
+                const directMessages = collectClaudeDirectDomMessages();
+                if (
+                    STATE.messageListContext === context &&
+                    STATE.messages.length > STATE.claudeCatalogMessages.length
+                ) {
+                    replaceClaudeCatalog(STATE.messages, context, 'claude-rendered-catalog-retained');
+                }
+                mergeClaudeDirectDomCatalog(directMessages, context);
+
+                if (
+                    STATE.claudeRemoteContext === context &&
+                    STATE.claudeRemoteMessages.length > STATE.claudeCatalogMessages.length
+                ) {
+                    replaceClaudeCatalog(STATE.claudeRemoteMessages, context, `${STATE.claudeRemoteSource}-conversation`);
+                }
+                if (STATE.claudeCatalogContext === context && STATE.claudeCatalogMessages.length) {
+                    STATE.lastTocSource = STATE.claudeCatalogSource;
+                    return bindLiveMessagesToClaudeCatalog(
+                        STATE.claudeCatalogMessages,
+                        directMessages.length ? directMessages : liveMessages
+                    );
+                }
+                STATE.lastTocSource = 'claude-live-dom-fallback';
+                return directMessages.length ? directMessages : liveMessages;
             }
         }
     };
@@ -2247,7 +2912,7 @@
     }
 
     function isExactUserTarget(target) {
-        return !!(target && target.matches && target.matches('[data-message-author-role="user"]'));
+        return !!(target && target.matches && target.matches(ADAPTER.selector));
     }
 
     function getMessageScrollTopByIndex(index, container) {
@@ -2355,11 +3020,17 @@
             if (!messageId) continue;
 
             const escapedId = escapeCssValue(messageId);
-            const direct = document.querySelector(`[data-message-author-role="user"][data-message-id="${escapedId}"]`);
+            const direct = document.querySelector([
+                `[data-message-author-role="user"][data-message-id="${escapedId}"]`,
+                `[data-testid^="user-message"][data-message-id="${escapedId}"]`,
+                `[data-testid^="user-message"][data-message-uuid="${escapedId}"]`,
+                `[data-message-id="${escapedId}"] [data-testid^="user-message"]`,
+                `[data-message-uuid="${escapedId}"] [data-testid^="user-message"]`
+            ].join(', '));
             if (direct && direct.isConnected) return direct;
         }
 
-        const users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+        const users = Array.from(document.querySelectorAll(ADAPTER.selector));
         for (let i = 0; i < users.length; i++) {
             const key = getMessageIdentityKeyFromElement(users[i]);
             if (identityKeys.includes(key)) return users[i];
@@ -2381,9 +3052,53 @@
         const identityMatch = findLiveUserElementByIdentityKeys(getMessageIdentityKeys(message));
         if (identityMatch) return { element: identityMatch, source: 'id' };
 
+        if (ADAPTER.id === 'claude') {
+            const comparable = getComparableMessageText(message.text);
+            const catalogMatches = STATE.messages.filter((candidate) => (
+                getComparableMessageText(candidate.text) === comparable
+            ));
+            const liveMatches = Array.from(document.querySelectorAll(ADAPTER.selector)).filter((element) => {
+                if (isClaudeComposerElement(element)) return false;
+                const container = ADAPTER.resolveMessageContainer(element);
+                const textElement = getClaudeMessageTextElement(container || element);
+                return getComparableMessageText(normalizeMessageText(textElement)) === comparable;
+            });
+            if (catalogMatches.length === 1 && liveMatches.length === 1) {
+                return { element: liveMatches[0], source: 'unique-text' };
+            }
+            return null;
+        }
+
         const slotMatch = findLiveUserElementInSlot(message, index);
         if (slotMatch) return slotMatch;
 
+        return null;
+    }
+
+    function findClaudeDirectUserElement(message, index) {
+        const root = getClaudeReferenceScrollContainer() || document;
+        const elements = Array.from(root.querySelectorAll('[data-testid="user-message"]'))
+            .filter((element) => !isClaudeComposerElement(element) && !element.closest('#ai-toc-v2_2'));
+        const targetText = getComparableMessageText(message && message.text);
+        const direct = elements[index];
+        if (direct && getComparableMessageText(normalizeMessageText(direct)) === targetText) {
+            return { element: direct, source: 'reference-index-text' };
+        }
+
+        const identityMatch = findLiveUserElementByIdentityKeys(getMessageIdentityKeys(message));
+        if (identityMatch && identityMatch.matches('[data-testid="user-message"]')) {
+            return { element: identityMatch, source: 'reference-id' };
+        }
+
+        const catalogOccurrence = STATE.messages.slice(0, index + 1).filter((candidate) => (
+            getComparableMessageText(candidate.text) === targetText
+        )).length - 1;
+        const textMatches = elements.filter((element) => (
+            getComparableMessageText(normalizeMessageText(element)) === targetText
+        ));
+        if (catalogOccurrence >= 0 && textMatches[catalogOccurrence]) {
+            return { element: textMatches[catalogOccurrence], source: 'reference-text-occurrence' };
+        }
         return null;
     }
 
@@ -3451,6 +4166,29 @@
         return active.index;
     }
 
+    function findClaudeActiveMessageIndex(messages) {
+        const container = getActiveScrollContainer();
+        const candidates = messages.reduce((result, message, index) => {
+            const target = getMessageTarget(message);
+            if (!target || !target.isConnected || !isVisibleElement(target)) return result;
+            const top = getMessageAbsoluteTop(message, container);
+            if (typeof top === 'number') result.push({ index, top });
+            return result;
+        }, []).sort((a, b) => a.top - b.top);
+
+        if (!candidates.length) {
+            return STATE.activeIndex >= 0 ? clampMessageIndex(STATE.activeIndex) : -1;
+        }
+
+        const threshold = getActiveThreshold(container);
+        let active = candidates[0];
+        for (let i = 0; i < candidates.length; i++) {
+            if (candidates[i].top <= threshold + 12) active = candidates[i];
+            else break;
+        }
+        return active.index;
+    }
+
     function scheduleManualActiveRelease(delay) {
         if (STATE.scrollSettleTimer) {
             window.clearTimeout(STATE.scrollSettleTimer);
@@ -3608,6 +4346,12 @@
         if (ADAPTER.id === 'chatgpt') {
             const chatGptActiveIndex = findChatGptActiveMessageIndex(messages);
             if (chatGptActiveIndex >= 0) return chatGptActiveIndex;
+            return STATE.activeIndex >= 0 ? clampMessageIndex(STATE.activeIndex) : 0;
+        }
+
+        if (ADAPTER.id === 'claude') {
+            const claudeActiveIndex = findClaudeActiveMessageIndex(messages);
+            if (claudeActiveIndex >= 0) return claudeActiveIndex;
             return STATE.activeIndex >= 0 ? clampMessageIndex(STATE.activeIndex) : 0;
         }
 
@@ -3845,6 +4589,30 @@
                     text: msg.text.slice(0, 80)
                 };
             }
+            return;
+        }
+
+        if (ADAPTER.id === 'claude') {
+            holdManualActiveIndex(index);
+            const directMatch = findClaudeDirectUserElement(msg, index);
+            if (!directMatch) {
+                STATE.lastNavigationDebug = {
+                    mode: 'claude-reference-target-unavailable',
+                    index,
+                    identityKeys: getMessageIdentityKeys(msg),
+                    directDomMessages: STATE.claudeDirectDomMessages,
+                    text: msg.text.slice(0, 80)
+                };
+                return;
+            }
+            STATE.lastNavigationDebug = {
+                mode: `claude-${directMatch.source}`,
+                index,
+                identityKeys: getMessageIdentityKeys(msg),
+                directDomMessages: STATE.claudeDirectDomMessages,
+                targetText: normalizeMessageText(directMatch.element).slice(0, 80)
+            };
+            scrollExactUserElementIntoView(directMatch.element, index, 'auto');
             return;
         }
 
@@ -4267,6 +5035,9 @@
                 STATE.messages = [];
             }
         }
+        if (ADAPTER.id === 'claude') {
+            STATE.messageListContext = getClaudeMessageContext();
+        }
         annotateMessagesWithNativeToc(messages);
         STATE.messages = messages;
         return messages;
@@ -4333,6 +5104,8 @@
 
     function bootstrap() {
         installChatGptConversationInterceptors();
+        installClaudeConversationInterceptors();
+        installClaudeResourceObserver();
         exposeDebugInfo();
         ensureAppRunning();
         if (getPanelElement()) {
